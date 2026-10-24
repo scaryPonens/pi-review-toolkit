@@ -1,0 +1,19 @@
+Pi Review Toolkit
+
+The six specialized prompts in prompts/ are adaptations of Anthropic's
+pr-review-toolkit from anthropics/claude-plugins-official:
+https://github.com/anthropics/claude-plugins-official/tree/ce721c1f1d5da2c281588818e072ae01a05d2e73/plugins/pr-review-toolkit
+Pinned upstream commit: ce721c1f1d5da2c281588818e072ae01a05d2e73
+Upstream paths: plugins/pr-review-toolkit/agents/{code-reviewer,pr-test-analyzer,
+silent-failure-hunter,type-design-analyzer,comment-analyzer,code-simplifier}.md
+Upstream license: Apache License 2.0, reproduced in LICENSE.
+The pinned plugin directory contains no separate NOTICE file.
+
+These prompts have been substantially changed for Pi: shared immutable scope,
+read-only tools, repository instruction paths, independent human judgment,
+impact-based severities, and a validated structured result protocol. Numeric
+confidence/criticality/design ratings are not mapped to severities. The
+code-simplifier is advisory only. No Claude Code orchestration, mutation, or
+assumed project-specific logging/style conventions remain.
+
+This package is not affiliated with or endorsed by Anthropic.

@@ -1,0 +1,27 @@
+{
+  "name": "pi-review-toolkit",
+  "version": "0.1.0",
+  "description": "Read-only parallel snapshot reviews for Pi",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": ["pi-package"],
+  "pi": { "extensions": ["./dist/extension.js"] },
+  "files": ["dist", "docs", "prompts", "LICENSE", "NOTICE", "README.md"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && tsx --test test/*.test.ts",
+    "prepack": "npm run build"
+  },
+  "engines": { "node": ">=22.19" },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "typebox": "*" },
+  "dependencies": { "diff": "8.0.4", "picomatch": "4.0.7", "yaml": "2.9.1" },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.3.0",
+    "typebox": "1.0.56",
+    "@types/node": "^22.0.0",
+    "@types/picomatch": "^4.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  }
+}
