@@ -1,4 +1,4 @@
-import { getAgentDir, getPackageDir, VERSION, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, getPackageDir, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { join } from "node:path";
 import { mkdtemp, writeFile, rm } from "node:fs/promises";
@@ -42,29 +42,86 @@ export default function reviewExtension(pi: ExtensionAPI) {
       return { content: [{ type: "text", text: JSON.stringify({ text, nextLine: end < lines.length ? end + 1 : null, totalLines: lines.length }) }], details: undefined };
     },
   });
+  function startReview(parsed: ReturnType<typeof parseArgs>, ctx: ExtensionContext, signal?: AbortSignal, onReport?: (report: Report) => Promise<void>) {
+    if (active) throw new Error("A /review is already active in this session. Use /review-cancel first.");
+    if (shuttingDown) throw new Error("Review session is shutting down");
+    if (process.platform !== "darwin" && process.platform !== "linux") throw new Error("This release supports macOS/Linux only");
+    if (VERSION !== "1.3.0") throw new Error(`Pi ${VERSION} is not verified; this version requires Pi 1.3.0 (Node/npm installation)`);
+    if (!ctx.model) throw new Error("Select a model and configure its credentials before /review");
+    const controller = new AbortController();
+    const combined = AbortSignal.any([controller.signal, ...[signal, ctx.signal].filter((s): s is AbortSignal => !!s)]);
+    const options = { ...parsed, cwd: ctx.cwd, provider: ctx.model.provider, model: ctx.model.id, sdkPath: join(getPackageDir(), "dist", "index.js"), agentDir: getAgentDir(), signal: combined };
+    const result = Promise.resolve().then(async () => {
+      try {
+        combined.throwIfAborted();
+        const report = await runReview({ ...options, onProgress: message => { if (!shuttingDown && ctx.hasUI) ctx.ui.setStatus("parallel-review", message); } });
+        if (combined.aborted) {
+          report.status = "incomplete";
+          if (report.humanJudgment !== "required") report.humanJudgment = "undetermined";
+          report.limitations.push("Run cancelled or deadline exceeded; review is incomplete.");
+        }
+        if (!shuttingDown) await onReport?.(report);
+        return report;
+      } finally {
+        active = undefined;
+        if (!shuttingDown && ctx.hasUI) ctx.ui.setStatus("parallel-review", undefined);
+      }
+    });
+    active = { controller, done: result.then(() => {}, () => {}) };
+    return result;
+  }
+  const severitySchema = Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")]);
+  pi.registerTool({
+    name: "review_changes", label: "Review changes",
+    description: "Review a stable Git snapshot using independent parallel read-only reviewers. Waits for completion. Resolve returned findings and invoke again to review your edits. Incomplete is never a pass; human judgment requests require operator handoff. Uses the configured remote default base.",
+    parameters: Type.Object({ min_severity: Type.Optional({ ...severitySchema, default: "medium" }) }),
+    outputSchema: Type.Object({
+      status: Type.Union([Type.Literal("passed"), Type.Literal("findings"), Type.Literal("incomplete")]),
+      minimumSeverity: severitySchema,
+      noChanges: Type.Boolean(),
+      findings: Type.Array(Type.Object({ severity: severitySchema, file: Type.String(), line: Type.Integer(), side: Type.Union([Type.Literal("old"), Type.Literal("new")]), description: Type.String(), suggestedResolution: Type.String() })),
+      reviewers: Type.Array(Type.Object({ reviewer: Type.String(), status: Type.Union([Type.Literal("completed"), Type.Literal("failed"), Type.Literal("skipped")]), reason: Type.String(), error: Type.Optional(Type.String()) })),
+      errors: Type.Array(Type.String()),
+      humanJudgment: Type.String(), judgments: Type.Array(Type.Unknown()),
+      runId: Type.Optional(Type.String()), snapshotId: Type.Optional(Type.String()), baseRef: Type.Optional(Type.String()), baseCommit: Type.Optional(Type.String()),
+    }),
+    async execute(_id, p, signal, _onUpdate, ctx) {
+      const minimumSeverity = p.min_severity ?? "medium";
+      try {
+        // Also validate direct callers, which may bypass Pi's schema validation.
+        const parsed = parseArgs(`--min-severity ${minimumSeverity}`);
+        const report = await startReview(parsed, ctx, signal);
+        const structuredContent = {
+          status: report.status === "no-changes" ? "passed" as const : report.status,
+          minimumSeverity, noChanges: report.status === "no-changes",
+          runId: report.runId, snapshotId: report.snapshotId, baseRef: report.baseRef, baseCommit: report.baseCommit,
+          findings: report.findings.map(f => ({ ...f })),
+          reviewers: report.selection.map(s => {
+            const outcome = report.outcomes.find(o => o.reviewer === s.reviewer);
+            return { reviewer: s.reviewer, status: !s.selected ? "skipped" : outcome?.result && !outcome.error ? "completed" : "failed", reason: s.reason, ...(s.selected && (!outcome?.result || outcome.error) ? { error: outcome?.error ?? "No validated reviewer result" } : {}) };
+          }),
+          errors: report.limitations, humanJudgment: report.humanJudgment, judgments: report.judgments.map(j => ({ ...j })),
+        };
+        let text = JSON.stringify(structuredContent);
+        if (text.length > 48000) {
+          await deliver(report);
+          text = JSON.stringify({ status: structuredContent.status, minimumSeverity, runId: report.runId, message: "Output exceeds inline limit. Read the COMPLETE actionable findings, reviewer errors, and human judgment requests with review_report, paging until nextLine is null. No findings have been discarded from structuredContent." });
+        }
+        return { content: [{ type: "text" as const, text }], details: structuredContent, structuredContent, isError: structuredContent.status === "incomplete" };
+      } catch (error) {
+        const structuredContent = { status: "incomplete" as const, minimumSeverity, noChanges: false, findings: [], reviewers: [], errors: [error instanceof Error ? error.message : String(error)], humanJudgment: "undetermined", judgments: [] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }], details: structuredContent, structuredContent, isError: true };
+      }
+    },
+  });
   pi.registerCommand("review", {
     description: "Review a stable Git snapshot with independent read-only reviewers; --base <ref> --min-severity low|medium|high|critical",
     handler: async (args, ctx) => {
       try {
         const parsed = parseArgs(args);
-        if (active) throw new Error("A /review is already active in this session. Use /review-cancel first.");
-        if (process.platform !== "darwin" && process.platform !== "linux") throw new Error("This release supports macOS/Linux only");
-        if (VERSION !== "1.3.0") throw new Error(`Pi ${VERSION} is not verified; this version requires Pi 1.3.0 (Node/npm installation)`);
-        if (!ctx.model) throw new Error("Select a model and configure its credentials before /review");
-        const controller = new AbortController();
-        const options = { ...parsed, cwd: ctx.cwd, provider: ctx.model.provider, model: ctx.model.id, sdkPath: join(getPackageDir(), "dist", "index.js"), agentDir: getAgentDir(), signal: controller.signal };
-        const done = Promise.resolve().then(async () => {
-          try {
-            const report = await runReview({ ...options, onProgress: message => { if (!shuttingDown && ctx.hasUI) ctx.ui.setStatus("parallel-review", message); } });
-            if (!shuttingDown) await deliver(report);
-          } catch (e) {
-            if (!shuttingDown) send(`Review status: incomplete\nHuman judgment: undetermined\n${e instanceof Error ? e.message : String(e)}\nNo review approval is implied.`);
-          } finally {
-            active = undefined;
-            if (!shuttingDown && ctx.hasUI) ctx.ui.setStatus("parallel-review", undefined);
-          }
+        const done = startReview(parsed, ctx, undefined, deliver).catch(e => {
+          if (!shuttingDown) send(`Review status: incomplete\nHuman judgment: undetermined\n${e instanceof Error ? e.message : String(e)}\nNo review approval is implied.`);
         });
-        active = { controller, done };
         if (ctx.hasUI) ctx.ui.notify("Review started. Use /review-cancel to cancel. Results will be appended without starting an agent turn.", "info");
         if (ctx.mode === "print" || ctx.mode === "json") await done;
       } catch (e) { send(e instanceof Error ? e.message : String(e)); }

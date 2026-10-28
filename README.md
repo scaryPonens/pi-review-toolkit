@@ -39,6 +39,14 @@ The selected ref is resolved to its merge base with `HEAD`. The report covers ch
 
 TUI/RPC commands start background work so `/review-cancel` remains usable. Print/JSON command handlers wait for completion, so the process cannot exit before the report is appended. The extension uses `pi.sendMessage(..., { triggerTurn: false })`, not a follow-up/user prompt. JSON/RPC/SDK consumers can inspect the custom `parallel-review` message and its structured `details.report`; plain print output is not a separate stable report protocol.
 
+### Model-callable review
+
+Agents can invoke `review_changes({ min_severity: "medium" })` (or `{}` for the same default). It waits for the same parallel, isolated, read-only review used by `/review`. The tool uses the configured remote default base; configure exactly one `refs/remotes/*/HEAD` before invoking it.
+
+The result includes `status` (`passed`, `findings`, or `incomplete`), `minimumSeverity`, actionable consolidated `findings` (severity, file, line, old/new side, description, suggested resolution), per-reviewer statuses/errors, coverage errors, snapshot/base identity, and unfiltered human-judgment requests. Data is available as JSON text, `structuredContent`, and `details`. An empty diff maps to `passed` with `noChanges: true` and skipped reviewers; `/review` retains its existing **no-changes** outcome.
+
+Resolve findings, then call the tool again to capture and review the updated checkout. An incomplete review is an error result, never success, even when partial findings are available. Human judgment still requires operator handoff. Large results explicitly direct the agent to read every `review_report` page; full structured results are retained. `/review-cancel` and session shutdown also cancel tool-started runs. No automatic fix/review loop is added.
+
 ### Model and credentials
 
 All reviewers use the invoking session's selected **provider and exact model ID**, with medium thinking (clamped by Pi). Workers read Pi's configured credential directory (`PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`) for `auth.json` and `models.json`, plus the normal trusted provider environment. No secrets are copied into the model prompt or report.
