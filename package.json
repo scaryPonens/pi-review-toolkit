@@ -5,8 +5,8 @@
   "type": "module",
   "license": "Apache-2.0",
   "keywords": ["pi-package"],
-  "pi": { "extensions": ["./dist/extension.js"] },
-  "files": ["dist", "docs", "prompts", "LICENSE", "NOTICE", "README.md"],
+  "pi": { "extensions": ["./dist/extension.js"], "skills": ["./skills"] },
+  "files": ["dist", "docs", "prompts", "skills", "LICENSE", "NOTICE", "README.md"],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",

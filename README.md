@@ -47,6 +47,21 @@ The result includes `status` (`passed`, `findings`, or `incomplete`), `minimumSe
 
 Resolve findings, then call the tool again to capture and review the updated checkout. An incomplete review is an error result, never success, even when partial findings are available. Human judgment still requires operator handoff. Large results explicitly direct the agent to read every `review_report` page; full structured results are retained. `/review-cancel` and session shutdown also cancel tool-started runs. No automatic fix/review loop is added.
 
+### Optional Build → Review → Fix skill
+
+Package installation also supplies [`build-review-fix`](skills/build-review-fix/SKILL.md). After installing/updating the package, run `/reload`, then invoke it from the target Git repository:
+
+```text
+/skill:build-review-fix <coding task>
+/skill:build-review-fix Implement <task>. Use min_severity: high and max_review_rounds: 2.
+```
+
+The current Pi agent implements the task, runs tests, calls `review_changes`, fixes actionable findings, and re-reviews. Defaults are medium severity and at most three review calls. Every round covers the accumulated changes against the original configured merge base, not just the latest fixes. The tool requires exactly one remote symbolic default (`refs/remotes/*/HEAD`); it has no base argument. The skill stops if that scope cannot be established or changes during the workflow.
+
+Completion requires a latest `passed` review, all applicable reviewers successfully completed, and passing relevant tests. Incomplete reviews, exhausted rounds, and human-judgment requests are reported rather than treated as approval. The extension itself remains read-only; this optional skill supplies workflow instructions, not another runtime or implementation agent.
+
+Loading only `dist/extension.js` with `-e` does not load the companion skill; also pass `--skill /absolute/path/to/pi-review-toolkit/skills/build-review-fix` or install the package. Remove any standalone copy of the same skill to avoid duplicate names. Discovery/package checks do not establish autonomous model behavior; a live implementation → defect review → fix → re-review smoke test remains unverified.
+
 ### Model and credentials
 
 All reviewers use the invoking session's selected **provider and exact model ID**, with medium thinking (clamped by Pi). Workers read Pi's configured credential directory (`PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`) for `auth.json` and `models.json`, plus the normal trusted provider environment. No secrets are copied into the model prompt or report.
