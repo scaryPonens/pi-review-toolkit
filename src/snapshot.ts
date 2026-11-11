@@ -250,40 +250,68 @@ const GENERATED_NAMES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.ya
 const DATA_EXTENSIONS = /\.(?:json|jsonl|ndjson|csv|tsv|snap|svg)$/i;
 /** A data file's hunks are collapsed once they exceed this many changed lines; small configuration files stay in the diff. */
 export const DATA_COLLAPSE_LINES = 200;
+/** What `.gitattributes` says about a path's place in the diff. */
+export interface DiffAttributes {
+  /** `linguist-generated`: true collapses, false marks hand-authored and keeps the file in the diff. */
+  generated?: boolean;
+  /** `review-collapse`: the toolkit's own attribute; it wins over every other rule. */
+  collapse?: boolean;
+}
 /**
- * Why a changed file's hunks stay out of the shared diff. Generated files (per `.gitattributes`
- * linguist-generated, minified or lockfile names) always collapse; data files collapse only when
- * large. The file's full text is still captured, so reviewers can read it and cite lines in it.
+ * Why a changed file's hunks stay out of the shared diff, or undefined to keep them. In order:
+ * `review-collapse` from .gitattributes decides outright; `linguist-generated=false` keeps a file,
+ * `linguist-generated` collapses it; then lockfiles, minified files and source maps collapse; then
+ * data files collapse once they are large. The file's full text is captured either way.
  */
-export function collapseReason(path: string, changed: number, generated: (path: string) => boolean): string | undefined {
-  const name = path.split("/").pop() ?? path;
-  if (generated(path)) return "generated per .gitattributes";
+export function collapseReason(path: string, changed: number, attributes: (path: string) => DiffAttributes): string | undefined {
+  const name = path.split("/").pop() ?? path, attr = attributes(path);
+  if (attr.collapse === false) return undefined;
+  if (attr.collapse === true) return "review-collapse per .gitattributes";
+  if (attr.generated === false) return undefined;
+  if (attr.generated === true) return "generated per .gitattributes";
   if (GENERATED_NAMES.has(name)) return "lockfile";
   if (/\.min\.(?:js|css)$/i.test(name) || /\.map$/i.test(name)) return "minified or source map";
   if (DATA_EXTENSIONS.test(name) && changed > DATA_COLLAPSE_LINES) return `data file, ${changed} changed lines`;
   return undefined;
 }
-/** `.gitattributes` patterns marked linguist-generated, matched like git does for the common forms. */
-export function generatedMatcher(gitattributes: string | undefined): (path: string) => boolean {
-  if (!gitattributes) return () => false;
-  const patterns: string[] = [];
+/**
+ * The diff-related attributes of `.gitattributes`, resolved like git does for the common forms:
+ * later lines override earlier ones, `name` and `name=true` set, `-name` and `name=false` unset,
+ * `!name` leaves the attribute unspecified. A pattern without a slash matches the basename anywhere;
+ * one with a slash is anchored at the repository root.
+ */
+export function diffAttributes(gitattributes: string | undefined): (path: string) => DiffAttributes {
+  if (!gitattributes) return () => ({});
+  const rules: { match: (path: string) => boolean; set: DiffAttributes }[] = [];
   for (const raw of gitattributes.split("\n")) {
     const line = raw.trim();
     if (!line || line.startsWith("#")) continue;
     const [pattern, ...attrs] = line.split(/\s+/);
-    if (!attrs.some(a => a === "linguist-generated" || a === "linguist-generated=true")) continue;
-    // A pattern without a slash matches the basename anywhere; one with a slash is anchored at the root.
-    patterns.push(pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`);
+    const set: DiffAttributes = {};
+    for (const attr of attrs) {
+      const m = /^(-|!)?([\w.-]+)(?:=(.*))?$/.exec(attr);
+      if (!m) continue;
+      const [, prefix, name, value] = m;
+      const key = name === "linguist-generated" ? "generated" : name === "review-collapse" ? "collapse" : undefined;
+      if (!key || prefix === "!") continue;
+      set[key] = prefix !== "-" && value !== "false";
+    }
+    if (set.generated === undefined && set.collapse === undefined) continue;
+    const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
+    rules.push({ match: picomatch(glob, { dot: true, nocase: false }), set });
   }
-  if (!patterns.length) return () => false;
-  const match = picomatch(patterns, { dot: true, nocase: false });
-  return path => match(path);
+  if (!rules.length) return () => ({});
+  return path => {
+    const out: DiffAttributes = {};
+    for (const rule of rules) if (rule.match(path)) Object.assign(out, rule.set);
+    return out;
+  };
 }
 const countLines = (text: string) => text.length ? text.split("\n").length - (text.endsWith("\n") ? 1 : 0) : 0;
 function assemble({ baseRef, baseCommit, head, old, current, scope, context, objects }: Captured, signal?: AbortSignal): Snapshot {
   const inScope = (entries: Record<string, Entry>) => Object.fromEntries(Object.entries(entries).filter(([path]) => scope.has(path)));
   const changes = makeChanges(inScope(old), inScope(current)), limitations: string[] = [];
-  const generated = generatedMatcher(current[".gitattributes"]?.text ?? old[".gitattributes"]?.text);
+  const attributes = diffAttributes(current[".gitattributes"]?.text ?? old[".gitattributes"]?.text);
   const patches: string[] = [];
   for (const c of changes) {
     const a = old[c.oldPath ?? c.path], b = current[c.path];
@@ -296,7 +324,7 @@ function assemble({ baseRef, baseCommit, head, old, current, scope, context, obj
       const body = full.split("\n").slice(4); // after the ---/+++ header
       c.added = body.filter(l => l.startsWith("+")).length;
       c.removed = body.filter(l => l.startsWith("-")).length;
-      const reason = collapseReason(c.path, c.added + c.removed, generated);
+      const reason = collapseReason(c.path, c.added + c.removed, attributes);
       if (reason) c.collapsed = reason; else patch = full;
     }
     const stats = c.added !== undefined ? `; +${c.added} -${c.removed}` : "";
