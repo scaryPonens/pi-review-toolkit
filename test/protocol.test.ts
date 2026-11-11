@@ -12,7 +12,7 @@ test("argument validation rejects invalid/missing/duplicate flags and unexpected
   assert.deepEqual(parseArgs("--pr 45093 --min-severity high"), { pr: 45093, minimumSeverity: "high" });
   assert.equal(parseArgs("--pr #12").pr, 12);
   for (const input of ["--pr", "--pr 0", "--pr 1.5", "--pr abc", "--pr 12345678901", "--pr 1 --pr 2"]) assert.throws(() => parseArgs(input), /Usage/);
-  assert.throws(() => parseArgs("--pr 1 --base main"), /mutually exclusive/);
+  assert.deepEqual(parseArgs("--pr 1 --base main"), { pr: 1, base: "main", minimumSeverity: "medium" });
 });
 test("strict result validation accepts captured new and deleted old locations", () => {
   const j = job(), r = result(j);

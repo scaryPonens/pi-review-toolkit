@@ -43,13 +43,20 @@ export interface Report {
   status: "incomplete" | "findings" | "passed" | "no-changes";
   humanJudgment: "required" | "not-identified" | "undetermined";
   selection: Selection[]; outcomes: Outcome[]; policies: Policies;
-  findings: (Finding & { reviewers: Reviewer[]; instructionReferences: NonNullable<Finding["instructionReference"]>[] })[];
+  findings: (Finding & { reviewers: Reviewer[]; instructionReferences: NonNullable<Finding["instructionReference"]>[]; touchedAbove?: number[] })[];
   judgments: (Judgment & { reviewers: Reviewer[] })[];
   limitations: string[];
+  /** The reviewed paths, so a stack review can tell which later pull requests touch a finding's file. */
+  changes: Change[];
 }
 export interface WorkerJob {
   runId: string; snapshot: Snapshot; reviewer: Reviewer; policies: Policies;
   minimumSeverity: Severity; provider: string; model: string;
   /** Absolute paths of operator-configured extensions loaded only to register model providers. */
   providerExtensions?: string[];
+  /** The reviewed pull request, when the review targets one. */
+  pullRequest?: PullRequest;
+  stack?: StackPosition;
 }
+/** A pull request's place in a stack: its parent pull request, if any, and the branch the stack merges into. */
+export interface StackPosition { parent?: { number: number; headRefName: string }; root: string; below: number[]; above: number[] }

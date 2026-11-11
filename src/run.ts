@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 import { capture, captureCommits, rootOf, selectBase } from "./snapshot.js";
 import { resolvePullRequest, type GhRunner, type PullRequest } from "./pr.js";
+import type { StackPosition } from "./types.js";
 import { loadPolicies } from "./policy.js";
 import { selectReviewers, aggregate as aggregateReport } from "./report.js";
 import { validateResult, MAX_RESULT } from "./protocol.js";
@@ -15,7 +16,9 @@ import type { Outcome, Report, Severity, Snapshot, WorkerJob } from "./types.js"
 export interface RunOptions {
   cwd: string; base?: string; pr?: number; gh?: GhRunner;
   /** `pr` already resolved by the caller, such as a stack review; skips another `gh pr view`. */
-  pullRequest?: PullRequest; minimumSeverity: Severity; provider: string; model: string;
+  pullRequest?: PullRequest;
+  /** Where `pr` sits in its stack, told to reviewers so they can place a finding. */
+  stack?: StackPosition; minimumSeverity: Severity; provider: string; model: string;
   sdkPath: string; agentDir: string; nodePath?: string; signal?: AbortSignal; providerExtensions?: string[];
   perReviewerMs?: number; wholeRunMs?: number;
   backend?: Backend; onProgress?: (text: string) => void;
@@ -52,11 +55,13 @@ export async function runReview(options: RunOptions): Promise<Report> {
   const root = await rootOf(options.cwd);
   let snapshot: Snapshot, pullRequest: PullRequest | undefined;
   if (options.pr !== undefined) {
-    if (options.base) throw new Error("A pull request review uses the pull request's own base; do not also pass a base");
     options.onProgress?.(`Resolving pull request #${options.pr}…`);
     pullRequest = options.pullRequest?.number === options.pr ? options.pullRequest : await resolvePullRequest(root, options.pr, options.gh);
+    // With a base, the pull request's head is compared against that ref instead of its own base: for a
+    // stacked pull request and the default branch, that is the whole stack's effect.
+    if (options.base) await selectBase(root, options.base);
     options.onProgress?.(`Capturing pull request #${pullRequest.number} commits…`);
-    snapshot = await captureCommits(root, pullRequest.baseOid, pullRequest.headOid, signal);
+    snapshot = await captureCommits(root, options.base ?? pullRequest.baseOid, pullRequest.headOid, signal);
   } else {
     const baseRef = await selectBase(root, options.base);
     options.onProgress?.("Capturing stable repository snapshot…");
@@ -91,7 +96,7 @@ export async function runReview(options: RunOptions): Promise<Report> {
         reviewerSignal.throwIfAborted();
         const cwd = join(directory, reviewer);
         await mkdir(cwd, { mode: 0o700 });
-        const job: WorkerJob = { runId, snapshot, reviewer, policies, minimumSeverity: options.minimumSeverity, provider: options.provider, model: options.model, ...(options.providerExtensions?.length ? { providerExtensions: options.providerExtensions } : {}) };
+        const job: WorkerJob = { runId, snapshot, reviewer, policies, minimumSeverity: options.minimumSeverity, provider: options.provider, model: options.model, ...(options.providerExtensions?.length ? { providerExtensions: options.providerExtensions } : {}), ...(pullRequest ? { pullRequest } : {}), ...(options.stack ? { stack: options.stack } : {}) };
         const { snapshot: _snapshot, ...descriptor } = job;
         const jobPath = join(cwd, "job.json"), resultPath = join(cwd, "result.json");
         await writeFile(jobPath, JSON.stringify({ ...descriptor, snapshotPath }), { mode: 0o400 });

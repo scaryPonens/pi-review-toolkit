@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve } from "node:path";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { runReview, type RunOptions } from "./run.js";
-import { parseStackArgs, renderStackReport, reviewStack, stackSummary, type StackReport } from "./stack-review.js";
+import { parseStackArgs, renderStackEntry, renderStackReport, reviewStack, stackSummary, statusLine, type StackArgs, type StackReport, type StackReview } from "./stack-review.js";
 import { parseArgs, renderReport } from "./report.js";
 import type { Report } from "./types.js";
 
@@ -45,10 +45,17 @@ export default function reviewExtension(pi: ExtensionAPI) {
     return path;
   }
   const retention = (path: string, runId: string) => `The COMPLETE report is available at ${path}, and through review_report with runId ${runId}. Read every page. Artifact retention: up to 24 hours or invoking-session shutdown/reload, whichever comes first; after a crash remove the private directory manually.`;
+  /** Each pull request's findings go out as soon as its review ends, so the author can start before the stack is done. */
+  async function deliverStackEntry(review: StackReview, index: number, total: number) {
+    const text = `[${index + 1}/${total}] ${renderStackEntry(review)}`;
+    if (text.length <= 48000) { send(text, { review }); return; }
+    const path = await retain(`${review.number}-${review.report?.runId ?? "incomplete"}`, text);
+    send(`[${index + 1}/${total}] ${statusLine(review).slice(2)}\nThis pull request's full report is too long to show inline. ${retention(path!, `${review.number}-${review.report?.runId}`)}`, { review });
+  }
   async function deliverStack(stack: StackReport) {
     const text = renderStackReport(stack), path = await retain(stack.runId, text);
-    if (!path) { send(text, { stack }); return; }
-    send([...stackSummary(stack), "", `This is a bounded SUMMARY: individual findings are excluded here. ${retention(path, stack.runId)}`, "Technical success is not human approval."].join("\n"), { stack });
+    const summary = [...stackSummary(stack), "", "Each pull request's report was sent above as its review finished."];
+    send([...summary, "", path ? `The COMBINED report is available at ${path}, and through review_report with runId ${stack.runId}.` : `The combined report is available through review_report with runId ${stack.runId}.`, "Technical success is not human approval."].join("\n"), { stack });
   }
   async function deliver(report: Report) {
     const text = renderReport(report), path = await retain(report.runId, text);
@@ -98,9 +105,9 @@ export default function reviewExtension(pi: ExtensionAPI) {
     active = { controller, done: result.then(() => {}, () => {}) };
     return result;
   }
-  function startStack(parsed: ReturnType<typeof parseStackArgs>, ctx: ExtensionContext, signal?: AbortSignal, onDone?: (stack: StackReport) => Promise<void>) {
+  function startStack(parsed: StackArgs, ctx: ExtensionContext, signal?: AbortSignal, onDone?: (stack: StackReport) => Promise<void>, onPullRequest?: (review: StackReview, index: number, total: number) => Promise<void>) {
     return startRun(ctx, signal, async (common, aborted) => {
-      const stack = await reviewStack({ ...common, ...parsed });
+      const stack = await reviewStack({ ...common, ...parsed, onPullRequest });
       if (aborted()) { stack.status = "incomplete"; stack.notes.push("Stack review cancelled or deadline exceeded; it is incomplete."); }
       return stack;
     }, onDone);
@@ -134,7 +141,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
   const severitySchema = Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high"), Type.Literal("critical")]);
   pi.registerTool({
     name: "review_changes", label: "Review changes",
-    description: "Review a stable Git snapshot using independent parallel read-only reviewers. Waits for completion. Resolve returned findings and invoke again to review your edits. Incomplete is never a pass; human judgment requests require operator handoff. By default reviews the working tree against the configured remote default base. Pass base (a parent branch) to review a branch in a stack, or pr to review a pull request's head commit against its own base branch without checking it out; base and pr are mutually exclusive. Nothing is fetched.",
+    description: "Review a stable Git snapshot using independent parallel read-only reviewers. Waits for completion. Resolve returned findings and invoke again to review your edits. Incomplete is never a pass; human judgment requests require operator handoff. By default reviews the working tree against the configured remote default base. Pass base (a parent branch) to review a branch in a stack, or pr to review a pull request's head commit against its own base branch without checking it out, or pr with base to review that head against another ref, such as the default branch for a stack's combined effect. Nothing is fetched.",
     parameters: Type.Object({
       min_severity: Type.Optional({ ...severitySchema, default: "medium" }),
       base: Type.Optional(Type.String({ minLength: 1, description: "Git ref to diff against, via its merge base with HEAD; for a stacked branch, its parent branch" })),
@@ -172,18 +179,20 @@ export default function reviewExtension(pi: ExtensionAPI) {
   });
   pi.registerTool({
     name: "review_stack", label: "Review stack",
-    description: "Review every open pull request in the stack under a pull request, bottom first and one at a time, each against its own base exactly as review_changes with pr does. Reports stack shape problems (closed or ambiguous parents, children behind their parent, tool-managed bases) before reviewing. Waits for completion. Incomplete is never a pass; human judgment requests require operator handoff. Nothing is fetched.",
+    description: "Review every open pull request in the stack under a pull request, bottom first and one at a time, each against its own base exactly as review_changes with pr does. Reports stack shape problems (closed or ambiguous parents, children behind their parent, tool-managed bases) before reviewing; findings whose file a later pull request changes again carry touchedAbove. With whole, also reviews the top pull request against the stack's root. Waits for completion. Incomplete is never a pass; human judgment requests require operator handoff. Nothing is fetched.",
     parameters: Type.Object({
       pr: Type.Integer({ minimum: 1, description: "Top pull request of the stack; every open pull request below it is reviewed" }),
       min_severity: Type.Optional({ ...severitySchema, default: "medium" }),
+      whole: Type.Optional(Type.Boolean({ description: "Also review the top pull request's head against the stack's root branch: the stack's combined effect", default: false })),
     }),
     async execute(_id, p, signal, _onUpdate, ctx) {
       const minimumSeverity = p.min_severity ?? "medium";
       try {
-        const stack = await startStack(parseStackArgs(`${p.pr} --min-severity ${minimumSeverity}`), ctx, signal);
+        const stack = await startStack(parseStackArgs(`${p.pr} --min-severity ${minimumSeverity}${p.whole ? " --whole" : ""}`), ctx, signal);
         const structuredContent = {
           status: stack.status, minimumSeverity, runId: stack.runId, root: stack.root, notes: stack.notes,
-          pullRequests: stack.reviews.map(r => ({ number: r.number, url: r.url, headRefName: r.headRefName, baseRefName: r.baseRefName, ...(r.parent ? { parent: r.parent } : {}), ...(r.report ? structured(r.report, minimumSeverity) : { status: "incomplete" as const, errors: [r.error ?? "Not reviewed"] }) })),
+          pullRequests: stack.reviews.map(r => ({ number: r.number, url: r.url, headRefName: r.headRefName, baseRefName: r.baseRefName, ...(r.parent ? { parent: r.parent } : {}), ...(r.behind ? { behind: r.behind } : {}), ...(r.report ? structured(r.report, minimumSeverity) : { status: "incomplete" as const, errors: [r.error ?? "Not reviewed"] }) })),
+          ...(stack.whole ? { whole: { number: stack.whole.number, headRefName: stack.whole.headRefName, baseRefName: stack.whole.baseRefName, ...(stack.whole.report ? structured(stack.whole.report, minimumSeverity) : { status: "incomplete" as const, errors: [stack.whole.error ?? "Not reviewed"] }) } } : {}),
         };
         let text = JSON.stringify(structuredContent);
         if (text.length > 48000) {
@@ -198,11 +207,11 @@ export default function reviewExtension(pi: ExtensionAPI) {
     },
   });
   pi.registerCommand("review-stack", {
-    description: "Review every open pull request in a stack, bottom first; <top pull request> [--min-severity low|medium|high|critical]",
+    description: "Review every open pull request in a stack, bottom first, reporting each as it finishes; <top pull request> [--whole] [--min-severity low|medium|high|critical]",
     handler: async (args, ctx) => {
       try {
         const parsed = parseStackArgs(args);
-        const done = startStack(parsed, ctx, undefined, deliverStack).catch(e => {
+        const done = startStack(parsed, ctx, undefined, deliverStack, deliverStackEntry).catch(e => {
           if (!shuttingDown) send(`Stack review status: incomplete\nHuman judgment: undetermined\n${e instanceof Error ? e.message : String(e)}\nNo review approval is implied.`);
         });
         if (ctx.hasUI) ctx.ui.notify(`Stack review of #${parsed.pr} started. Pull requests are reviewed one at a time; use /review-cancel to stop. Results will be appended without starting an agent turn.`, "info");

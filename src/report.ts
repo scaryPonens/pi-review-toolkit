@@ -1,5 +1,5 @@
 import { reviewers, severities, type Selection, type Snapshot, type Policies, type Severity, type Outcome, type Report } from "./types.js";
-export const usage = "/review [--base <git-ref> | --pr <number>] [--min-severity low|medium|high|critical]";
+export const usage = "/review [--pr <number>] [--base <git-ref>] [--min-severity low|medium|high|critical]";
 export interface ReviewArgs { base?: string; pr?: number; minimumSeverity: Severity }
 export function parseArgs(input: string): ReviewArgs {
   // Refs and severities cannot contain whitespace, so shell evaluation/quoting is unnecessary.
@@ -19,7 +19,6 @@ export function parseArgs(input: string): ReviewArgs {
     else if (severities.includes(value as Severity)) options.minimumSeverity = value as Severity;
     else throw new Error(`Invalid severity ${JSON.stringify(value)}. Usage: ${usage}`);
   }
-  if (options.base && options.pr) throw new Error(`--base and --pr are mutually exclusive; a pull request supplies its own base. Usage: ${usage}`);
   return options;
 }
 export function selectReviewers(snapshot: Snapshot): Selection[] {
@@ -68,6 +67,7 @@ export function aggregate(runId: string, snapshot: Snapshot, policies: Policies,
     status: incomplete ? "incomplete" : !snapshot.changes.length ? "no-changes" : findings.length ? "findings" : "passed",
     humanJudgment: judgments.length ? "required" : incomplete ? "undetermined" : "not-identified",
     selection, outcomes, policies, findings, judgments, limitations,
+    changes: snapshot.changes.map(c => ({ ...c })),
   };
 }
 export function renderReport(report: Report): string {

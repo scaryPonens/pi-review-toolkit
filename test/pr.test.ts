@@ -60,3 +60,15 @@ test("commit capture covers only the child's changes and ignores the working tre
     assert.equal(moved.baseCommit, r.parent); assert.deepEqual(moved.changes.map(c => c.path), ["src/a.ts"]);
   } finally { await r.dispose(); }
 });
+test("reviewers are told where a pull request sits in its stack", async () => {
+  const { stackNote } = await import("../src/worker.js");
+  const { job } = await import("./helpers.js");
+  const pullRequest = { number: 2, state: "OPEN", url: "u", baseRefName: "one", headRefName: "two", baseOid: "a".repeat(40), headOid: "b".repeat(40) };
+  assert.equal(stackNote(job()), "", "no stack, no note");
+  const middle = stackNote({ ...job(), pullRequest, stack: { parent: { number: 1, headRefName: "one" }, root: "main", below: [1], above: [3] } });
+  assert.match(middle, /#2 \(two\) is stacked on #1 \(one\)/);
+  assert.match(middle, /#1 are stacked below it and merge first; their code is pre-existing for this review/);
+  assert.match(middle, /#3 are stacked above it and are reviewed separately/);
+  const bottom = stackNote({ ...job(), pullRequest, stack: { root: "main", below: [], above: [3] } });
+  assert.match(bottom, /is based on main\. It is the bottom of its stack, on main\./);
+});

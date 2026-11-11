@@ -53,9 +53,10 @@ test("stack shape problems are reported, and unresolvable stacks fail clearly", 
   await assert.rejects(resolveStack("/unused", 1, async () => { throw new Error("gh: not logged in"); }), /Cannot read the default branch with gh: gh: not logged in/);
 });
 test("stack arguments take one pull request and an optional severity", () => {
-  assert.deepEqual(parseStackArgs("#45294"), { pr: 45294, minimumSeverity: "medium" });
-  assert.deepEqual(parseStackArgs("--min-severity high 12"), { pr: 12, minimumSeverity: "high" });
-  for (const bad of ["", "1 2", "abc", "1 --min-severity", "1 --min-severity urgent", "1 --base main"]) assert.throws(() => parseStackArgs(bad), /Usage: \/review-stack/);
+  assert.deepEqual(parseStackArgs("#45294"), { pr: 45294, minimumSeverity: "medium", whole: false });
+  assert.deepEqual(parseStackArgs("--min-severity high 12"), { pr: 12, minimumSeverity: "high", whole: false });
+  assert.deepEqual(parseStackArgs("7 --whole"), { pr: 7, minimumSeverity: "medium", whole: true });
+  for (const bad of ["", "1 2", "abc", "1 --min-severity", "1 --min-severity urgent", "1 --base main", "1 --whole --whole"]) assert.throws(() => parseStackArgs(bad), /Usage: \/review-stack/);
 });
 
 async function gitStack() {
@@ -66,7 +67,7 @@ async function gitStack() {
   const two = await r.git("rev-parse", "HEAD");
   return { ...r, one, two };
 }
-const report = (number: number, status: Report["status"]): Report => ({ runId: `run-${number}`, snapshotId: "s", baseRef: "b", baseCommit: "c", minimumSeverity: "medium", status, humanJudgment: "not-identified", selection: [], outcomes: [], policies: { instructions: [], errors: [] }, findings: [], judgments: [], limitations: [] });
+const report = (number: number, status: Report["status"], changed: string[] = [], findings: string[] = []): Report => ({ runId: `run-${number}`, snapshotId: "s", baseRef: "b", baseCommit: "c", minimumSeverity: "medium", status, humanJudgment: "not-identified", selection: [], outcomes: [], policies: { instructions: [], errors: [] }, judgments: [], limitations: [], changes: changed.map(path => ({ path, status: "modified" as const })), findings: findings.map(file => ({ severity: "medium" as const, file, line: 1, side: "new" as const, description: "d", suggestedResolution: "r", reviewers: ["code-reviewer" as const], instructionReferences: [] })) });
 const options = (cwd: string, gh: GhRunner, signal?: AbortSignal) => ({ cwd, pr: 2, gh, signal, minimumSeverity: "medium" as const, provider: "p", model: "m", sdkPath: "/unused", agentDir: "/unused" });
 
 test("a stack is reviewed bottom first, one pull request at a time, and every pull request is reported", async () => {
@@ -79,12 +80,15 @@ test("a stack is reviewed bottom first, one pull request at a time, and every pu
       assert.equal(++running, 1, "reviews never overlap"); order.push(o.pr!);
       assert.equal(o.base, undefined);
       assert.equal(o.pullRequest?.headOid, o.pr === 1 ? r.one : r.two, "the stack passes each pull request it already resolved");
+      assert.deepEqual(o.stack, o.pr === 1 ? { root: "main", below: [], above: [2] } : { parent: { number: 1, headRefName: "one" }, root: "main", below: [1], above: [] });
       await new Promise(resolve => setTimeout(resolve, 20)); running--;
       if (o.pr === 1) throw new Error("reviewer backend unavailable");
       return report(o.pr!, "findings");
     };
-    const stack = await reviewStack(options(r.root, gh), review);
+    const delivered: string[] = [];
+    const stack = await reviewStack({ ...options(r.root, gh), onPullRequest: async (entry, i, total) => { delivered.push(`${i + 1}/${total} #${entry.number} ${entry.report?.status ?? entry.error}`); } }, review);
     assert.deepEqual(order, [1, 2]);
+    assert.deepEqual(delivered, ["1/2 #1 reviewer backend unavailable", "2/2 #2 findings"], "each pull request is delivered as soon as its review ends");
     assert.equal(stack.status, "incomplete", "a pull request that could not be reviewed makes the stack incomplete");
     assert.equal(stack.reviews[0].error, "reviewer backend unavailable"); assert.equal(stack.reviews[1].report?.status, "findings");
     const text = renderStackReport(stack);
@@ -108,10 +112,33 @@ test("a stack review names one fetch for all missing commits, flags children beh
     const gh = fakeGh([pr(1, "one", "main", moved, r.base), pr(2, "two", "one", r.two, moved)]);
     const behind = await reviewStack(options(r.root, gh), async o => report(o.pr!, "passed"));
     assert.match(behind.notes.join("\n"), /#2 does not contain #1's latest head; rebase it onto #1/);
+    assert.equal(behind.reviews[1].behind, 1);
+    assert.match(renderStackReport(behind), /- #2 two: passed \(.*\) — behind #1, rebase first/);
 
     const controller = new AbortController();
     const cancelled = await reviewStack(options(r.root, gh, controller.signal), async o => { controller.abort(); return report(o.pr!, "incomplete"); });
     assert.deepEqual(cancelled.reviews.map(x => x.error ?? x.report?.status), ["incomplete", "Not started: the stack review was cancelled"]);
     assert.equal(cancelled.status, "incomplete");
+  } finally { await r.dispose(); }
+});
+test("the whole-stack review compares the top against the root, and findings name later pull requests that touch their file", async () => {
+  const r = await gitStack();
+  try {
+    const gh = fakeGh([pr(1, "one", "main", r.one, r.base), pr(2, "two", "one", r.two, r.one)]);
+    const seen: { pr?: number; base?: string }[] = [];
+    const stack = await reviewStack({ ...options(r.root, gh), whole: true }, async o => {
+      seen.push({ pr: o.pr, base: o.base });
+      if (o.base) return report(o.pr!, "passed", ["one.ts", "two.ts"]);
+      return o.pr === 1 ? report(1, "findings", ["one.ts"], ["one.ts", "src/a.ts"]) : report(2, "findings", ["one.ts", "two.ts"], ["two.ts"]);
+    });
+    assert.deepEqual(seen, [{ pr: 1, base: undefined }, { pr: 2, base: undefined }, { pr: 2, base: "main" }]);
+    assert.equal(stack.whole?.whole, true); assert.equal(stack.whole?.baseRefName, "main"); assert.equal(stack.whole?.report?.status, "passed");
+    const [onePr] = stack.reviews;
+    assert.deepEqual(onePr.report!.findings.map(f => [f.file, f.touchedAbove]), [["one.ts", [2]], ["src/a.ts", undefined]]);
+    assert.equal(stack.reviews[1].report!.findings[0].touchedAbove, undefined, "nothing above the top");
+    const text = renderStackReport(stack);
+    assert.match(text, /- whole stack: #2 two against main: passed/);
+    assert.match(text, /Touched above: one\.ts:1 is changed again by #2/);
+    assert.match(text, /## Whole stack: #2 two against main/);
   } finally { await r.dispose(); }
 });

@@ -94,7 +94,9 @@ test("review_changes reviews a stacked branch against its parent, or a pull requ
     assert.deepEqual(pr.pullRequest, { number: 7, state: "OPEN", url: "https://example.invalid/pull/7", baseRefName: "parent", headRefName: "child", baseOid: parent, headOid: child });
     assert.equal(await r.git("branch", "--show-current"), "main");
 
-    const both = await invoke({ pr: 7, base: "parent" });
-    assert.equal(both.isError, true); assert.match(both.structuredContent.errors[0], /mutually exclusive/);
+    // pr with base: the pull request's head against another ref; against main, the child's review includes the parent's README change.
+    const whole = (await invoke({ pr: 7, base: "main" })).structuredContent;
+    assert.equal(whole.status, "findings", JSON.stringify(whole)); assert.equal(whole.baseRef, "main"); assert.equal(whole.pullRequest?.number, 7);
+    assert.equal(whole.baseCommit, r.base);
   } finally { await r.dispose(); }
 });
