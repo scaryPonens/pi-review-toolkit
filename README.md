@@ -112,7 +112,7 @@ These are this extension's conventions, not Copilot's actual file paths:
 
 - `.agent/reviewer-instructions.md`: repository-wide review guidance.
 - `.agent/instructions/**/*.instructions.md`: recursively discovered path-specific guidance.
-- `.agents/HUMAN.md` (or root `HUMAN.md`; not both): circumstances requiring human judgment or approval. No nested inheritance.
+- `.agents/HUMAN.md` (or root `HUMAN.md`; not both): circumstances requiring human judgment or approval. No nested inheritance. When the repository has neither, the operator's own `~/.pi/agent/HUMAN.md` applies instead, read at run time rather than captured with the snapshot; a repository file replaces it whole.
 
 All are captured with the snapshot. Missing files are normal. Ignored untracked policy files are still captured as guidance, but are not added to the review diff solely because they were discovered. Files are sorted by repository-relative path; order is not precedence.
 

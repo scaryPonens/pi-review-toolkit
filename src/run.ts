@@ -7,7 +7,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { capture, captureCommits, rootOf, selectBase } from "./snapshot.js";
 import { resolvePullRequest, type GhRunner, type PullRequest } from "./pr.js";
 import type { StackPosition } from "./types.js";
-import { loadPolicies } from "./policy.js";
+import { loadPolicies, withUserHuman } from "./policy.js";
 import { selectReviewers, aggregate as aggregateReport } from "./report.js";
 import { validateResult, MAX_RESULT } from "./protocol.js";
 import { chooseBackend, quote, type Backend } from "./backend.js";
@@ -69,7 +69,7 @@ export async function runReview(options: RunOptions): Promise<Report> {
     snapshot = await capture(root, baseRef, signal);
   }
   const aggregate = (...args: Parameters<typeof aggregateReport>) => ({ ...aggregateReport(...args), ...(pullRequest ? { pullRequest } : {}) });
-  const policies = loadPolicies(snapshot), selection = selectReviewers(snapshot);
+  const policies = withUserHuman(loadPolicies(snapshot), options.agentDir), selection = selectReviewers(snapshot);
   if (!snapshot.changes.length) return aggregate(runId, snapshot, policies, options.minimumSeverity, selection, []);
   if (policies.errors.length) return aggregate(runId, snapshot, policies, options.minimumSeverity, selection, selection.filter(s => s.selected).map(s => ({ reviewer: s.reviewer, error: "Policy configuration failed; reviewer not launched" })));
   signal.throwIfAborted();

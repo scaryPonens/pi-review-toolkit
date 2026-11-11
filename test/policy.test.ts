@@ -45,3 +45,21 @@ test("HUMAN.md may live under .agents, and not in both places", () => {
   assert.equal(both.human?.path, ".agents/HUMAN.md");
   assert.ok(both.errors.some(e => /both/.test(e)));
 });
+
+test("the operator's HUMAN.md applies only when the repository has none", async () => {
+  const { withUserHuman } = await import("../src/policy.js");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const agentDir = mkdtempSync(join(tmpdir(), "agent-"));
+  const s = snapshot();
+  delete s.current[".agents/HUMAN.md"];
+  assert.equal(withUserHuman(loadPolicies(s), agentDir).human, undefined);
+  writeFileSync(join(agentDir, "HUMAN.md"), "# Mine\nAsk me.\n");
+  const mine = withUserHuman(loadPolicies(s), agentDir);
+  assert.equal(mine.human?.path, join(agentDir, "HUMAN.md"));
+  assert.equal(mine.human?.content, "# Mine\nAsk me.\n");
+  // A repository file wins whole.
+  const repo = withUserHuman(loadPolicies(snapshot()), agentDir);
+  assert.equal(repo.human?.path, ".agents/HUMAN.md");
+});

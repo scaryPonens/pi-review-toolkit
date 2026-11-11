@@ -1,6 +1,11 @@
-/** Where HUMAN.md may live: `.agents/HUMAN.md` is preferred; the repository root is accepted. */
-export type HumanPath = ".agents/HUMAN.md" | "HUMAN.md";
+/**
+ * Where HUMAN.md may live. In the repository, `.agents/HUMAN.md` is preferred and the root is
+ * accepted; when the repository has neither, the operator's own `<agentDir>/HUMAN.md` applies and
+ * its path is recorded as the absolute file read.
+ */
+export type HumanPath = ".agents/HUMAN.md" | "HUMAN.md" | (string & {});
 export const humanPaths: readonly HumanPath[] = [".agents/HUMAN.md", "HUMAN.md"];
+export const USER_HUMAN = "HUMAN.md";
 import type { PullRequest } from "./pr.js";
 export const reviewers = ["code-reviewer", "pr-test-analyzer", "silent-failure-hunter", "type-design-analyzer", "comment-analyzer", "code-simplifier"] as const;
 export type Reviewer = typeof reviewers[number];
