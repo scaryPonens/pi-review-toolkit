@@ -1,18 +1,25 @@
 import { reviewers, severities, type Selection, type Snapshot, type Policies, type Severity, type Outcome, type Report } from "./types.js";
-export const usage = "/review [--base <git-ref>] [--min-severity low|medium|high|critical]";
-export function parseArgs(input: string): { base?: string; minimumSeverity: Severity } {
+export const usage = "/review [--base <git-ref> | --pr <number>] [--min-severity low|medium|high|critical]";
+export interface ReviewArgs { base?: string; pr?: number; minimumSeverity: Severity }
+export function parseArgs(input: string): ReviewArgs {
   // Refs and severities cannot contain whitespace, so shell evaluation/quoting is unnecessary.
   const tokens = input.trim().split(/\s+/).filter(Boolean);
-  const options: { base?: string; minimumSeverity: Severity } = { minimumSeverity: "medium" };
+  const options: ReviewArgs = { minimumSeverity: "medium" };
   const seen = new Set<string>();
   for (let i = 0; i < tokens.length; i += 2) {
     const flag = tokens[i], value = tokens[i + 1];
-    if (!["--base", "--min-severity"].includes(flag) || seen.has(flag) || !value || value.startsWith("-")) throw new Error(`Invalid or missing argument. Usage: ${usage}`);
+    if (!["--base", "--pr", "--min-severity"].includes(flag) || seen.has(flag) || !value || value.startsWith("-")) throw new Error(`Invalid or missing argument. Usage: ${usage}`);
     seen.add(flag);
     if (flag === "--base") options.base = value;
+    else if (flag === "--pr") {
+      const digits = value.replace(/^#/, "");
+      if (!/^[1-9]\d{0,9}$/.test(digits)) throw new Error(`Invalid pull request number ${JSON.stringify(value)}. Usage: ${usage}`);
+      options.pr = Number(digits);
+    }
     else if (severities.includes(value as Severity)) options.minimumSeverity = value as Severity;
     else throw new Error(`Invalid severity ${JSON.stringify(value)}. Usage: ${usage}`);
   }
+  if (options.base && options.pr) throw new Error(`--base and --pr are mutually exclusive; a pull request supplies its own base. Usage: ${usage}`);
   return options;
 }
 export function selectReviewers(snapshot: Snapshot): Selection[] {
@@ -68,8 +75,11 @@ export function renderReport(report: Report): string {
     report.status === "no-changes" ? "No changes to review (no reviewers launched)." : `Review status: ${report.status}`,
     `Minimum severity: ${report.minimumSeverity.toUpperCase()}`,
     `Human judgment: ${report.humanJudgment}`,
-    `Base: ${report.baseRef} (${report.baseCommit})`, `Snapshot: ${report.snapshotId}`,
-    "This report covers the captured snapshot, not subsequent working-tree edits. Technical success is not human approval.",
+    ...(report.pullRequest ? [`Pull request: #${report.pullRequest.number} (${report.pullRequest.state}) ${report.pullRequest.url}`, `Head: ${report.pullRequest.headRefName} (${report.pullRequest.headOid})`, `Base: ${report.pullRequest.baseRefName} (${report.pullRequest.baseOid}); merge base ${report.baseCommit}`] : [`Base: ${report.baseRef} (${report.baseCommit})`]),
+    `Snapshot: ${report.snapshotId}`,
+    report.pullRequest
+      ? "This report covers the pull request's head commit against its base branch, not the local working tree. Technical success is not human approval."
+      : "This report covers the captured snapshot, not subsequent working-tree edits. Technical success is not human approval.",
     `Reviewers: ${report.outcomes.filter(o => o.result && !o.error).length} completed / ${report.selection.filter(s => s.selected).length} selected`,
   ];
   for (const s of report.selection) {

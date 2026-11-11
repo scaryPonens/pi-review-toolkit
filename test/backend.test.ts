@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { HerdrBackend, TmuxBackend, chooseBackend, quote, type CommandRunner } from "../src/backend.js";
+import { HerdrBackend, OrcaBackend, TmuxBackend, chooseBackend, orcaCli, quote, type CommandRunner } from "../src/backend.js";
 
 test("Herdr parses creation IDs, preserves focus and cleans only owned panes idempotently", async () => {
   const calls: string[][] = [];
@@ -54,4 +54,40 @@ test("cleanup failures remain explicit and retryable", async () => {
   await b.start("command", "/tmp");
   assert.equal((await b.cleanup()).length, 1);
   fail = false; assert.deepEqual(await b.cleanup(), []);
+});
+test("Orca runs reviewers in one unfocused tab, splitting its largest pane, and cleans only owned panes", async () => {
+  const calls: string[][] = [];
+  let next = 0, closeFails = false;
+  const run: CommandRunner = async (binary, args) => {
+    calls.push([binary, ...args]);
+    const handle = `term_${++next}`;
+    if (args[1] === "create") return JSON.stringify({ ok: true, result: { terminal: { handle } } });
+    if (args[1] === "split") return JSON.stringify({ ok: true, result: { split: { handle } } });
+    if (args[1] === "close" && closeFails) return JSON.stringify({ ok: false, error: { code: "terminal_not_found", message: "gone" } });
+    if (args[1] === "show") return JSON.stringify({ ok: true, result: { terminal: { handle: args[3], connected: false } } });
+    return JSON.stringify({ ok: true, result: {} });
+  };
+  const b = new OrcaBackend("orca", run);
+  const ids = await Promise.all(Array.from({ length: 4 }, (_, i) => b.start(`echo ${i}`, "/tmp/reviewer dir")));
+  assert.deepEqual(ids, ["term_1", "term_2", "term_3", "term_4"]);
+  const creates = calls.filter(c => c[2] === "create"), splits = calls.filter(c => c[2] === "split");
+  assert.equal(creates.length, 1); assert(!creates[0].includes("--focus")); assert(creates.every(c => c.at(-1) === "--json"));
+  // 2x1 tab: split left/right, then each half top/bottom.
+  assert.deepEqual(splits.map(c => [c[4], c[6]]), [["term_1", "vertical"], ["term_1", "horizontal"], ["term_2", "horizontal"]]);
+  assert.equal(creates[0][creates[0].indexOf("--command") + 1], `/bin/sh -c ${quote(`cd ${quote("/tmp/reviewer dir")} || exit 1; echo 0`)}`);
+  await b.close("term_999"); assert(!calls.some(c => c[2] === "close" && c[4] === "term_999"));
+  closeFails = true;
+  assert.deepEqual(await b.cleanup(), []);
+  assert.deepEqual(calls.filter(c => c[2] === "close").map(c => c[4]).sort(), ids);
+});
+test("an Orca session selects Orca, and a failing Orca CLI is an error rather than a tmux fallback", async () => {
+  const ok: CommandRunner = async () => JSON.stringify({ ok: true, result: { terminal: { handle: "term_me" } } });
+  assert.equal((await chooseBackend(ok, { ORCA_TERMINAL_HANDLE: "term_me" })).name, "orca");
+  const calls: string[] = [];
+  const down: CommandRunner = async binary => { calls.push(binary); return JSON.stringify({ ok: false, error: { code: "runtime_unavailable", message: "Orca is not running" } }); };
+  await assert.rejects(chooseBackend(down, { ORCA_TERMINAL_HANDLE: "term_me", ORCA_CLI_COMMAND: "orca-wsl" }), /runtime_unavailable: Orca is not running/);
+  assert.deepEqual(calls, ["orca-wsl"]);
+  assert.equal(orcaCli({}), "orca"); assert.equal(orcaCli({ ORCA_DEV_REPO_ROOT: "/x" }), "orca-dev");
+  // Herdr keeps precedence when both are present.
+  assert.equal((await chooseBackend(async () => "herdr 0.8.1", { HERDR_ENV: "1", HERDR_PANE_ID: "w1:p1", ORCA_TERMINAL_HANDLE: "term_me" })).name, "herdr");
 });

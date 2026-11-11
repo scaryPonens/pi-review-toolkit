@@ -4,16 +4,19 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
-import { capture, rootOf, selectBase } from "./snapshot.js";
+import { capture, captureCommits, rootOf, selectBase } from "./snapshot.js";
+import { resolvePullRequest, type GhRunner, type PullRequest } from "./pr.js";
 import { loadPolicies } from "./policy.js";
-import { selectReviewers, aggregate } from "./report.js";
+import { selectReviewers, aggregate as aggregateReport } from "./report.js";
 import { validateResult, MAX_RESULT } from "./protocol.js";
 import { chooseBackend, quote, type Backend } from "./backend.js";
-import type { Outcome, Report, Severity, WorkerJob } from "./types.js";
+import type { Outcome, Report, Severity, Snapshot, WorkerJob } from "./types.js";
 
 export interface RunOptions {
-  cwd: string; base?: string; minimumSeverity: Severity; provider: string; model: string;
-  sdkPath: string; agentDir: string; nodePath?: string; signal?: AbortSignal;
+  cwd: string; base?: string; pr?: number; gh?: GhRunner;
+  /** `pr` already resolved by the caller, such as a stack review; skips another `gh pr view`. */
+  pullRequest?: PullRequest; minimumSeverity: Severity; provider: string; model: string;
+  sdkPath: string; agentDir: string; nodePath?: string; signal?: AbortSignal; providerExtensions?: string[];
   perReviewerMs?: number; wholeRunMs?: number;
   backend?: Backend; onProgress?: (text: string) => void;
 }
@@ -47,9 +50,19 @@ export async function runReview(options: RunOptions): Promise<Report> {
   const deadline = AbortSignal.timeout(options.wholeRunMs ?? 20 * 60 * 1000);
   const signal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
   const root = await rootOf(options.cwd);
-  const baseRef = await selectBase(root, options.base);
-  options.onProgress?.("Capturing stable repository snapshot…");
-  const snapshot = await capture(root, baseRef, signal);
+  let snapshot: Snapshot, pullRequest: PullRequest | undefined;
+  if (options.pr !== undefined) {
+    if (options.base) throw new Error("A pull request review uses the pull request's own base; do not also pass a base");
+    options.onProgress?.(`Resolving pull request #${options.pr}…`);
+    pullRequest = options.pullRequest?.number === options.pr ? options.pullRequest : await resolvePullRequest(root, options.pr, options.gh);
+    options.onProgress?.(`Capturing pull request #${pullRequest.number} commits…`);
+    snapshot = await captureCommits(root, pullRequest.baseOid, pullRequest.headOid, signal);
+  } else {
+    const baseRef = await selectBase(root, options.base);
+    options.onProgress?.("Capturing stable repository snapshot…");
+    snapshot = await capture(root, baseRef, signal);
+  }
+  const aggregate = (...args: Parameters<typeof aggregateReport>) => ({ ...aggregateReport(...args), ...(pullRequest ? { pullRequest } : {}) });
   const policies = loadPolicies(snapshot), selection = selectReviewers(snapshot);
   if (!snapshot.changes.length) return aggregate(runId, snapshot, policies, options.minimumSeverity, selection, []);
   if (policies.errors.length) return aggregate(runId, snapshot, policies, options.minimumSeverity, selection, selection.filter(s => s.selected).map(s => ({ reviewer: s.reviewer, error: "Policy configuration failed; reviewer not launched" })));
@@ -78,7 +91,7 @@ export async function runReview(options: RunOptions): Promise<Report> {
         reviewerSignal.throwIfAborted();
         const cwd = join(directory, reviewer);
         await mkdir(cwd, { mode: 0o700 });
-        const job: WorkerJob = { runId, snapshot, reviewer, policies, minimumSeverity: options.minimumSeverity, provider: options.provider, model: options.model };
+        const job: WorkerJob = { runId, snapshot, reviewer, policies, minimumSeverity: options.minimumSeverity, provider: options.provider, model: options.model, ...(options.providerExtensions?.length ? { providerExtensions: options.providerExtensions } : {}) };
         const { snapshot: _snapshot, ...descriptor } = job;
         const jobPath = join(cwd, "job.json"), resultPath = join(cwd, "result.json");
         await writeFile(jobPath, JSON.stringify({ ...descriptor, snapshotPath }), { mode: 0o400 });

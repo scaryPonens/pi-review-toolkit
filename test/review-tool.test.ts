@@ -28,8 +28,10 @@ const backend: Backend = {
   },
   async close() {}, async cleanup() { return []; },
 };
+let pullRequest: Record<string, unknown> = {};
+const gh = async () => JSON.stringify(pullRequest);
 mock.module("../dist/run.js", { namedExports: {
-  runReview: (options: Parameters<typeof realRunReview>[0]) => realRunReview({ ...options, backend, perReviewerMs: mode === "timeout" ? 30 : 10000 }),
+  runReview: (options: Parameters<typeof realRunReview>[0]) => realRunReview({ ...options, backend, gh, perReviewerMs: mode === "timeout" ? 30 : 10000 }),
 } });
 const { default: reviewExtension } = await import("../dist/extension.js");
 
@@ -63,5 +65,36 @@ test("registered review_changes returns actionable filtered findings and fails c
     await r.put("src/a.ts", "export const a = 1;\n");
     const fixed = await invoke();
     assert.equal(fixed.structuredContent.status, "passed"); assert.equal(fixed.structuredContent.noChanges, true);
+  } finally { await r.dispose(); }
+});
+test("review_changes reviews a stacked branch against its parent, or a pull request without checking it out", { timeout: 30000 }, async () => {
+  const r = await repo();
+  try {
+    mode = "success";
+    await r.git("switch", "-c", "parent");
+    await r.put("README.md", "# Parent\n"); await r.git("commit", "-am", "parent");
+    const parent = await r.git("rev-parse", "HEAD");
+    await r.git("switch", "-c", "child");
+    await r.put("src/a.ts", "export const a = 2;\n"); await r.git("commit", "-am", "child");
+    const child = await r.git("rev-parse", "HEAD");
+    let tool: any;
+    reviewExtension({ registerTool(t: any) { if (t.name === "review_changes") tool = t; }, registerCommand() {}, on() {}, sendMessage() {} } as unknown as ExtensionAPI);
+    const invoke = (params: object) => tool.execute("test", params, undefined, undefined, { cwd: r.root, model: { provider: "fixture", id: "fixture" }, hasUI: false });
+
+    // Against main the child's review would include the parent's README change; against its parent it does not.
+    const stacked = (await invoke({ base: "parent" })).structuredContent;
+    assert.equal(stacked.status, "findings", JSON.stringify(stacked)); assert.equal(stacked.baseCommit, parent); assert.equal(stacked.pullRequest, undefined);
+
+    await r.git("switch", "main");
+    await r.put("src/a.ts", "uncommitted edit on another branch\n");
+    pullRequest = { number: 7, state: "OPEN", url: "https://example.invalid/pull/7", baseRefName: "parent", headRefName: "child", baseRefOid: parent, headRefOid: child };
+    const result = await invoke({ pr: 7 }), pr = result.structuredContent;
+    assert.equal(result.isError, false, JSON.stringify(pr)); assert.equal(pr.status, "findings");
+    assert.equal(pr.baseCommit, parent);
+    assert.deepEqual(pr.pullRequest, { number: 7, state: "OPEN", url: "https://example.invalid/pull/7", baseRefName: "parent", headRefName: "child", baseOid: parent, headOid: child });
+    assert.equal(await r.git("branch", "--show-current"), "main");
+
+    const both = await invoke({ pr: 7, base: "parent" });
+    assert.equal(both.isError, true); assert.match(both.structuredContent.errors[0], /mutually exclusive/);
   } finally { await r.dispose(); }
 });

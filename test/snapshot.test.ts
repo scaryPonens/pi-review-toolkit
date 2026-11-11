@@ -20,7 +20,7 @@ test("real Git snapshot includes committed, staged, unstaged, untracked final co
     assert(s.changes.some(c => c.path === "committed.ts")); assert(s.changes.some(c => c.path === "untracked.ts"));
     assert(!s.current["ignored.tmp"]); assert(s.diff.includes("final unstaged"));
     assert.deepEqual(await readFile(join(r.root, ".git/index")), index);
-    await r.put("src/a.ts", "later edit\n"); assert.equal(readSnapshot(s, "src/a.ts", "new").text, "1: final unstaged");
+    await r.put("src/a.ts", "later edit\n"); assert.equal((await readSnapshot(s, "src/a.ts", "new")).text, "1: final unstaged");
     const s2 = await capture(r.root, "main"); assert.notEqual(s.id, s2.id);
     assert.equal(await rootOf(join(r.root, "src")), r.root);
   } finally { await r.dispose(); }
@@ -39,8 +39,8 @@ test("empty diff, exact rename, deletion and unsupported changed content are exp
     assert(s.changes.some(c => c.status === "renamed" && c.oldPath === "src/a.ts" && c.path === "src/b.ts"));
     assert(s.changes.some(c => c.status === "deleted" && c.path === "README.md"));
     for (const path of ["binary.dat", "large.dat", "escape", "pointer"]) assert(s.limitations.some(x => x.startsWith(path)));
-    assert.throws(() => readSnapshot(s, "escape", "new"), /Unsupported/);
-    for (const path of ["../escape", "/etc/passwd", "src/../../escape"]) assert.throws(() => readSnapshot(s, path, "new"), /relative/);
+    await assert.rejects(readSnapshot(s, "escape", "new"), /Unsupported/);
+    for (const path of ["../escape", "/etc/passwd", "src/../../escape"]) await assert.rejects(readSnapshot(s, path, "new"), /relative/);
   } finally { await r.dispose(); }
 });
 test("unchanged oversized content is not a false-positive change", async () => {

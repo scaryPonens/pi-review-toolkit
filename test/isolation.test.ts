@@ -19,24 +19,32 @@ test("reviewer allowlist denies shell, writes, external reads, symlinks and recu
   await assert.rejects(invoke(boundary.tools, "read_snapshot", { path: "escape", side: "new" }), /Unsupported/);
   assert.equal(j.snapshot.current["src/a.ts"].text, "export const a = 2;\n");
 });
-test("reader pagination and literal search remain inside snapshot data", () => {
+test("reader pagination and literal search remain inside snapshot data", async () => {
   const j = job();
   j.snapshot.current["src/a.ts"].text = Array.from({ length: 250 }, (_, i) => `line ${i} [literal]`).join("\n");
-  assert.equal(readSnapshot(j.snapshot, "src/a.ts", "new", 1, 200).nextLine, 201);
-  assert.equal(readSnapshot(j.snapshot, "src/a.ts", "new", 201, 200).nextLine, null);
-  const search = searchSnapshot(j.snapshot, "[literal]", "new");
+  assert.equal((await readSnapshot(j.snapshot, "src/a.ts", "new", 1, 200)).nextLine, 201);
+  assert.equal((await readSnapshot(j.snapshot, "src/a.ts", "new", 201, 200)).nextLine, null);
+  const search = await searchSnapshot(j.snapshot, "[literal]", "new");
   assert.equal(search.total, 250); assert.equal(search.nextOffset, 100);
-  assert.equal(searchSnapshot(j.snapshot, "[literal]", "new", 200).nextOffset, null);
+  assert.equal((await searchSnapshot(j.snapshot, "[literal]", "new", 200)).nextOffset, null);
   assert(listSnapshot(j.snapshot, "old").files.some(f => f.path === "old.ts"));
 });
 test("validated submission terminates; invalid output never becomes an approval", async () => {
   const j = job(), valid = workerTools(j, sdk, typebox);
   const submitted = await invoke(valid.tools, "submit_review", { json: JSON.stringify(result(j)) }) as { terminate: boolean };
   assert.equal(submitted.terminate, true); assert.equal(valid.completed().runId, j.runId);
+  const repaired = workerTools(j, sdk, typebox);
+  const rejected = await invoke(repaired.tools, "submit_review", { json: JSON.stringify({ ...result(j), extra: 1 }) }) as { terminate?: boolean; content: { text: string }[] };
+  assert.equal(rejected.terminate, undefined); assert.match(rejected.content[0].text, /result: unknown fields \[\\"extra\\"\]/);
+  assert.throws(() => repaired.completed(), /without/);
+  await invoke(repaired.tools, "submit_review", { json: JSON.stringify(result(j)) });
+  assert.equal(repaired.completed().runId, j.runId);
+  await invoke(repaired.tools, "submit_review", { json: JSON.stringify(result(j)) });
+  assert.throws(() => repaired.completed(), /Duplicate/);
   const invalid = workerTools(j, sdk, typebox);
-  await invoke(invalid.tools, "submit_review", { json: "{" });
+  for (let i = 0; i < 3; i++) await invoke(invalid.tools, "submit_review", { json: "{" });
   await invoke(invalid.tools, "submit_review", { json: JSON.stringify(result(j)) });
-  assert.throws(() => invalid.completed(), /invalid|Duplicate/i);
+  assert.throws(() => invalid.completed(), /Rejected after 3 invalid submissions/);
   const missing = workerTools(j, sdk, typebox); assert.throws(() => missing.completed(), /without/);
   const blocked = workerTools(j, sdk, typebox);
   await invoke(blocked.tools, "cannot_complete_review", { reason: "Required file is unsupported" });

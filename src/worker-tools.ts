@@ -4,9 +4,19 @@ import type { WorkerJob, Result } from "./types.js";
 import { readSnapshot, listSnapshot, searchSnapshot } from "./reader.js";
 import { parseResult, MAX_RESULT } from "./protocol.js";
 
+/** Invalid submissions a reviewer may correct before it fails; each is answered with the exact validation error. */
+export const MAX_SUBMISSIONS = 3;
 export function workerTools(job: WorkerJob, sdk: typeof SDK, { Type }: typeof TB) {
   let result: Result | undefined;
   let failure: string | undefined;
+  let rejected = 0;
+  /** Count an invalid submission; the last allowed one fails the reviewer. Returns whether another attempt remains. */
+  function reject(reason: string): boolean {
+    rejected++;
+    if (rejected < MAX_SUBMISSIONS) return true;
+    failure ??= `Rejected after ${MAX_SUBMISSIONS} invalid submissions. ${reason}`;
+    return false;
+  }
   const response = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(data) }], details: undefined });
   const side = Type.Union([Type.Literal("old"), Type.Literal("new")]);
   const offset = Type.Optional(Type.Integer({ minimum: 0 }));
@@ -16,7 +26,7 @@ export function workerTools(job: WorkerJob, sdk: typeof SDK, { Type }: typeof TB
       parameters: Type.Object({ start: Type.Optional(Type.Integer({ minimum: 1 })), count: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })) }),
       async execute(_id, p) {
         const synthetic = { ...job.snapshot, current: { "review.diff": { text: job.snapshot.diff, hash: "", mode: "100644" } } };
-        return response(readSnapshot(synthetic, "review.diff", "new", p.start, p.count));
+        return response(await readSnapshot(synthetic, "review.diff", "new", p.start, p.count));
       },
     }),
     sdk.defineTool({
@@ -28,29 +38,35 @@ export function workerTools(job: WorkerJob, sdk: typeof SDK, { Type }: typeof TB
       },
     }),
     sdk.defineTool({
-      name: "read_snapshot", label: "Read snapshot", description: "Read numbered lines from a captured repository file. No live filesystem access. Use nextLine for pagination.",
+      name: "read_snapshot", label: "Read snapshot", description: "Read numbered lines from a repository file in the snapshot: changed files as captured, unchanged files from their committed contents. No live filesystem access. Use nextLine for pagination.",
       parameters: Type.Object({ path: Type.String(), side, start: Type.Optional(Type.Integer({ minimum: 1 })), count: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })) }),
-      async execute(_id, p) { return response(readSnapshot(job.snapshot, p.path, p.side, p.start, p.count)); },
+      async execute(_id, p) { return response(await readSnapshot(job.snapshot, p.path, p.side, p.start, p.count)); },
     }),
     sdk.defineTool({
-      name: "list_snapshot", label: "List snapshot", description: "List captured repository paths and content limitations, paginated in batches of 100.",
+      name: "list_snapshot", label: "List snapshot", description: "List every repository path on one side of the snapshot, changed or not, with content limitations, paginated in batches of 100.",
       parameters: Type.Object({ side, offset }),
       async execute(_id, p) { return response(listSnapshot(job.snapshot, p.side, p.offset)); },
     }),
     sdk.defineTool({
-      name: "search_snapshot", label: "Search snapshot", description: "Literal case-sensitive text search within captured UTF-8 repository files. Returns bounded excerpts and nextOffset.",
+      name: "search_snapshot", label: "Search snapshot", description: "Literal case-sensitive text search across all UTF-8 repository files on one side of the snapshot, changed or not. Returns bounded excerpts and nextOffset.",
       parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 1000 }), side, offset }),
-      async execute(_id, p) { return response(searchSnapshot(job.snapshot, p.query, p.side, p.offset)); },
+      async execute(_id, p) { return response(await searchSnapshot(job.snapshot, p.query, p.side, p.offset)); },
     }),
     sdk.defineTool({
-      name: "submit_review", label: "Submit review", description: "Finish the review. Supply the complete ReviewerResult contract serialized as strict JSON (no markdown fences). A malformed submission fails this reviewer permanently.",
+      name: "submit_review", label: "Submit review", description: `Finish the review. Supply the complete ReviewerResult contract serialized as strict JSON (no markdown fences). An invalid submission is answered with the exact validation error; correct it and call submit_review again. After ${MAX_SUBMISSIONS} invalid submissions this reviewer fails.`,
       parameters: Type.Object({ json: Type.String({ maxLength: MAX_RESULT }) }),
       async execute(_id, p) {
-        try {
-          if (result || failure) throw new Error("Duplicate or previously invalid submission");
-          result = parseResult(p.json, job);
-        } catch (e) { failure ??= e instanceof Error ? e.message : String(e); }
-        return { ...response(failure ? { error: failure } : { submitted: true }), terminate: true };
+        if (result || failure) {
+          failure ??= "Duplicate submission after a validated result";
+          return { ...response({ error: failure }), terminate: true };
+        }
+        try { result = parseResult(p.json, job); }
+        catch (e) {
+          const reason = e instanceof Error ? e.message : String(e);
+          if (reject(reason)) return response({ error: reason, attemptsRemaining: MAX_SUBMISSIONS - rejected, instruction: "Fix exactly this error and call submit_review again with the complete corrected result." });
+          return { ...response({ error: failure }), terminate: true };
+        }
+        return { ...response({ submitted: true }), terminate: true };
       },
     }),
     sdk.defineTool({
@@ -59,7 +75,7 @@ export function workerTools(job: WorkerJob, sdk: typeof SDK, { Type }: typeof TB
       async execute(_id, p) { failure = p.reason; return { ...response({ error: failure }), terminate: true }; },
     }),
   ];
-  return { tools, invalidate(reason: string) { failure = reason; }, completed() {
+  return { tools, rejectArguments: reject, completed() {
     if (failure) throw new Error(failure);
     if (!result) throw new Error("Worker exited without a validated submit_review result");
     return result;

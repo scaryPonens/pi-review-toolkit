@@ -44,9 +44,27 @@ test("six fresh Pi SDK sessions overlap with no shared conversation history", { 
   } finally { await model.dispose(); await rm(cwd, { recursive: true, force: true }); }
 });
 
-test("invalid structured-output arguments cannot be repaired into a successful reviewer outcome", { timeout: 30000 }, async () => {
-  const model = await mockModel(0, false, true), cwd = await mkdtemp(join(tmpdir(), "review-sdk-invalid-"));
+test("a reviewer sees each validation error and may correct its submission", { timeout: 30000 }, async () => {
+  const model = await mockModel(0, false, ["fields", "arguments"]), cwd = await mkdtemp(join(tmpdir(), "review-sdk-repair-"));
   try {
-    await assert.rejects(runWorker(job(), sdk, typebox, cwd, model.directory), /validation/);
+    const result = await runWorker(job(), sdk, typebox, cwd, model.directory);
+    assert.equal(result.reviewer, "code-reviewer");
+    const toolResults = model.requests.at(-1).messages.filter((m: any) => m.role === "tool").map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
+    assert.match(toolResults[0], /result: unknown fields \[\\*"confidence\\*"\]/);
+    assert.match(toolResults[1], /validat/i);
+    assert.match(toolResults[0], /attemptsRemaining/);
+  } finally { await model.dispose(); await rm(cwd, { recursive: true, force: true }); }
+});
+test("three invalid submissions fail the reviewer; invalid output never becomes an approval", { timeout: 30000 }, async () => {
+  const model = await mockModel(0, false, ["fields", "arguments", "fields"]), cwd = await mkdtemp(join(tmpdir(), "review-sdk-invalid-"));
+  try {
+    await assert.rejects(runWorker(job(), sdk, typebox, cwd, model.directory), /Rejected after 3 invalid submissions\. Invalid reviewer result: result: unknown fields \["confidence"\]/);
+    assert.equal(model.requests.length, 3);
+  } finally { await model.dispose(); await rm(cwd, { recursive: true, force: true }); }
+});
+test("a model request failure is reported as such, not as a missing submission", { timeout: 30000 }, async () => {
+  const model = await mockModel(0, false, [], true), cwd = await mkdtemp(join(tmpdir(), "review-sdk-unavailable-"));
+  try {
+    await assert.rejects(runWorker(job(), sdk, typebox, cwd, model.directory), /Model request failed before a result was submitted: .*503|Model request failed before a result was submitted: .*unreachable/);
   } finally { await model.dispose(); await rm(cwd, { recursive: true, force: true }); }
 });
