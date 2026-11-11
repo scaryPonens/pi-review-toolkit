@@ -6,6 +6,7 @@ import type * as SDK from "@earendil-works/pi-coding-agent";
 import type * as TB from "typebox";
 import type { Result, Spend, WorkerJob } from "./types.js";
 import { workerTools } from "./worker-tools.js";
+import { clean, progressLine } from "./progress.js";
 
 /**
  * Load operator-configured extensions solely for the model providers they register. The extensions'
@@ -62,7 +63,11 @@ export async function runWorker(job: WorkerJob, sdk: typeof SDK, typebox: typeof
     tools: boundary.tools.map(t => t.name), customTools: boundary.tools, thinkingLevel: "medium",
   });
   let modelError: string | undefined;
+  const show = (line: string) => { process.stdout.write(`${line}\n`); };
+  show(`${job.reviewer} reviewer · snapshot ${job.snapshot.id.slice(0, 12)}${job.pullRequest ? ` · PR #${job.pullRequest.number}` : ""} · ${clean(`${job.provider}/${job.model}`)}`);
   const unsubscribe = session.subscribe(event => {
+    const line = progressLine(event);
+    if (line !== undefined) show(line);
     // A provider or network failure ends the turn with an error message rather than a submission; keep it for the report.
     if (event.type === "message_end" && event.message.role === "assistant" && event.message.stopReason === "error") modelError = event.message.errorMessage ?? "model request failed";
     // Pi rejects arguments that do not match the tool schema before execute runs; that counts as an invalid submission.
@@ -98,7 +103,12 @@ async function main() {
     await mkdir(cwd, { recursive: true, mode: 0o700 });
     const { result, spend } = await runWorker(job, sdk, tb, cwd, agentDir);
     envelope = { ok: true, result, spend };
-  } catch (e) { envelope = { ok: false, error: (e instanceof Error ? e.message : String(e)).slice(0, 12000) }; }
+    process.stdout.write(`\nDone: ${result.findings.length} finding(s), ${result.humanJudgmentRequests.length} judgment(s), ${spend.requests} request(s), $${spend.cost.toFixed(2)}\n`);
+  } catch (e) {
+    const error = (e instanceof Error ? e.message : String(e)).slice(0, 12000);
+    envelope = { ok: false, error };
+    process.stdout.write(`\nFailed: ${clean(error.slice(0, 600))}\n`);
+  }
   await writeFile(`${outputPath}.tmp`, JSON.stringify(envelope), { mode: 0o600 });
   await rename(`${outputPath}.tmp`, outputPath);
 }
