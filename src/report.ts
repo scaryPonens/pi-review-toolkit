@@ -1,4 +1,4 @@
-import { reviewers, severities, type Selection, type Snapshot, type Policies, type Severity, type Outcome, type Report } from "./types.js";
+import { reviewers, severities, type Selection, type Snapshot, type Policies, type Severity, type Outcome, type Report, type Spend } from "./types.js";
 export const usage = "/review [--pr <number>] [--base <git-ref>] [--min-severity low|medium|high|critical]";
 export interface ReviewArgs { base?: string; pr?: number; minimumSeverity: Severity }
 export function parseArgs(input: string): ReviewArgs {
@@ -70,6 +70,13 @@ export function aggregate(runId: string, snapshot: Snapshot, policies: Policies,
     changes: snapshot.changes.map(c => ({ ...c })),
   };
 }
+const tokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : String(n);
+export const spendLine = (s: Spend) => `${s.requests} requests, ${tokens(s.input + s.cacheRead + s.cacheWrite)} in (${tokens(s.cacheRead)} cached), ${tokens(s.output)} out${s.cost ? `, ~$${s.cost.toFixed(2)}` : ""}`;
+export function totalSpend(outcomes: Outcome[]): Spend | undefined {
+  const spends = outcomes.map(o => o.spend).filter((s): s is Spend => !!s);
+  if (!spends.length) return undefined;
+  return spends.reduce((t, s) => ({ input: t.input + s.input, output: t.output + s.output, cacheRead: t.cacheRead + s.cacheRead, cacheWrite: t.cacheWrite + s.cacheWrite, requests: t.requests + s.requests, cost: t.cost + s.cost }));
+}
 export function renderReport(report: Report): string {
   const lines = [
     report.status === "no-changes" ? "No changes to review (no reviewers launched)." : `Review status: ${report.status}`,
@@ -84,8 +91,10 @@ export function renderReport(report: Report): string {
   ];
   for (const s of report.selection) {
     const o = report.outcomes.find(o => o.reviewer === s.reviewer);
-    lines.push(`- ${s.reviewer}: ${!s.selected ? "skipped" : o?.result && !o.error ? "completed" : "failed"} — ${o?.error ?? s.reason}`);
+    lines.push(`- ${s.reviewer}: ${!s.selected ? "skipped" : o?.result && !o.error ? "completed" : "failed"} — ${o?.error ?? s.reason}${o?.spend ? ` — ${spendLine(o.spend)}` : ""}`);
   }
+  const total = totalSpend(report.outcomes);
+  if (total) lines.push(`Spend: ${spendLine(total)} across ${report.outcomes.filter(o => o.spend).length} reviewers`);
   lines.push(`HUMAN.md: ${report.policies.human ? `present at ${report.policies.human.path} (${report.policies.human.hash})` : "absent or unavailable; see limitations"}`);
   for (const i of report.policies.instructions) {
     lines.push(`Instruction: ${i.path} — ${i.global ? "repository-wide" : i.appliesTo.length ? "path-specific" : "no matching changed paths"}`);

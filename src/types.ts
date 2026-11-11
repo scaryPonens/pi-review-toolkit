@@ -8,7 +8,13 @@ export const severities = ["low", "medium", "high", "critical"] as const;
 export type Severity = typeof severities[number];
 /** A captured file. Context files carry `blob` instead of `text`: their contents are read from git objects on demand. */
 export interface Entry { hash: string; mode: string; text?: string; blob?: string; limitation?: string }
-export interface Change { path: string; oldPath?: string; status: "added" | "modified" | "deleted" | "renamed" }
+export interface Change {
+  path: string; oldPath?: string; status: "added" | "modified" | "deleted" | "renamed";
+  /** Lines added and removed, when both sides are text. */
+  added?: number; removed?: number;
+  /** Why the file's hunks are left out of the shared diff; its full text is still readable with read_snapshot. */
+  collapsed?: string;
+}
 export interface Snapshot {
   id: string; baseRef: string; baseCommit: string; head: string;
   /** Changed and policy files, with full contents, on each side. */
@@ -35,7 +41,9 @@ export interface Result {
   findings: Finding[]; humanJudgmentRequests: Judgment[];
 }
 export interface Selection { reviewer: Reviewer; selected: boolean; reason: string }
-export interface Outcome { reviewer: Reviewer; result?: Result; error?: string }
+/** Tokens a reviewer spent, summed over its model requests; cost is the catalog estimate in USD. */
+export interface Spend { input: number; output: number; cacheRead: number; cacheWrite: number; requests: number; cost: number }
+export interface Outcome { reviewer: Reviewer; result?: Result; error?: string; spend?: Spend }
 export interface Report {
   runId: string; snapshotId: string; baseRef: string; baseCommit: string; minimumSeverity: Severity;
   /** Set when the review targeted a pull request's commits rather than the working tree. */

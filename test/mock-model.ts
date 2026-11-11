@@ -32,7 +32,7 @@ export async function mockModel(delay = 0, attack = false, invalid: ("arguments"
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       const event = (choices: unknown[]) => `data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices })}\n\n`;
       res.write(event([{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }]));
-      res.write(event([{ index: 0, delta: {}, finish_reason: "tool_calls" }])); res.end("data: [DONE]\n\n");
+      res.write(`data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1200, completion_tokens: 40, total_tokens: 1240 } })}\n\n`); res.end("data: [DONE]\n\n");
     } catch (e) { errors.push(e as Error); res.writeHead(500); res.end("fixture error"); }
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));

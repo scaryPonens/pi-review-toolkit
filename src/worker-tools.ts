@@ -30,7 +30,7 @@ export function workerTools(job: WorkerJob, sdk: typeof SDK, { Type }: typeof TB
       },
     }),
     sdk.defineTool({
-      name: "review_changes", label: "Review manifest", description: "Read the shared changed-file manifest, including old paths for renames, in batches of 100.",
+      name: "review_changes", label: "Review manifest", description: "Read the shared changed-file manifest in batches of 100: path, status, old path for renames, added and removed line counts, and a collapsed reason for generated or large data files whose hunks are omitted from the diff.",
       parameters: Type.Object({ offset }),
       async execute(_id, p) {
         const at = p.offset ?? 0, total = job.snapshot.changes.length;

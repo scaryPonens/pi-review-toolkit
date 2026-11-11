@@ -1,4 +1,5 @@
 import { getAgentDir, getPackageDir, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { isAbsolute, join, resolve } from "node:path";
 import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
@@ -124,6 +125,8 @@ export default function reviewExtension(pi: ExtensionAPI) {
     }, onReport);
   }
   /** The model-facing shape of one review result, shared by review_changes and review_stack. */
+  /** Structured content must be plain JSON; optional fields are dropped rather than left undefined. */
+  const json = <T,>(value: T): JsonObject => JSON.parse(JSON.stringify(value));
   function structured(report: Report, minimumSeverity: string) {
     return {
       status: report.status === "no-changes" ? "passed" as const : report.status,
@@ -133,7 +136,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
       findings: report.findings.map(f => ({ ...f })),
       reviewers: report.selection.map(s => {
         const outcome = report.outcomes.find(o => o.reviewer === s.reviewer);
-        return { reviewer: s.reviewer, status: !s.selected ? "skipped" : outcome?.result && !outcome.error ? "completed" : "failed", reason: s.reason, ...(s.selected && (!outcome?.result || outcome.error) ? { error: outcome?.error ?? "No validated reviewer result" } : {}) };
+        return { reviewer: s.reviewer, status: !s.selected ? "skipped" : outcome?.result && !outcome.error ? "completed" : "failed", reason: s.reason, ...(s.selected && (!outcome?.result || outcome.error) ? { error: outcome?.error ?? "No validated reviewer result" } : {}), ...(outcome?.spend ? { spend: outcome.spend } : {}) };
       }),
       errors: report.limitations, humanJudgment: report.humanJudgment, judgments: report.judgments.map(j => ({ ...j })),
     };
@@ -152,7 +155,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
       minimumSeverity: severitySchema,
       noChanges: Type.Boolean(),
       findings: Type.Array(Type.Object({ severity: severitySchema, file: Type.String(), line: Type.Integer(), side: Type.Union([Type.Literal("old"), Type.Literal("new")]), description: Type.String(), suggestedResolution: Type.String() })),
-      reviewers: Type.Array(Type.Object({ reviewer: Type.String(), status: Type.Union([Type.Literal("completed"), Type.Literal("failed"), Type.Literal("skipped")]), reason: Type.String(), error: Type.Optional(Type.String()) })),
+      reviewers: Type.Array(Type.Object({ reviewer: Type.String(), status: Type.Union([Type.Literal("completed"), Type.Literal("failed"), Type.Literal("skipped")]), reason: Type.String(), error: Type.Optional(Type.String()), spend: Type.Optional(Type.Object({ input: Type.Number(), output: Type.Number(), cacheRead: Type.Number(), cacheWrite: Type.Number(), requests: Type.Number(), cost: Type.Number() })) })),
       errors: Type.Array(Type.String()),
       humanJudgment: Type.String(), judgments: Type.Array(Type.Unknown()),
       runId: Type.Optional(Type.String()), snapshotId: Type.Optional(Type.String()), baseRef: Type.Optional(Type.String()), baseCommit: Type.Optional(Type.String()),
@@ -170,7 +173,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
           await deliver(report);
           text = JSON.stringify({ status: structuredContent.status, minimumSeverity, runId: report.runId, message: "Output exceeds inline limit. Read the COMPLETE actionable findings, reviewer errors, and human judgment requests with review_report, paging until nextLine is null. No findings have been discarded from structuredContent." });
         }
-        return { content: [{ type: "text" as const, text }], details: structuredContent, structuredContent, isError: structuredContent.status === "incomplete" };
+        return { content: [{ type: "text" as const, text }], details: structuredContent, structuredContent: json(structuredContent), isError: structuredContent.status === "incomplete" };
       } catch (error) {
         const structuredContent = { status: "incomplete" as const, minimumSeverity, noChanges: false, findings: [], reviewers: [], errors: [error instanceof Error ? error.message : String(error)], humanJudgment: "undetermined", judgments: [] };
         return { content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }], details: structuredContent, structuredContent, isError: true };
@@ -199,7 +202,7 @@ export default function reviewExtension(pi: ExtensionAPI) {
           const path = await retain(stack.runId, renderStackReport(stack));
           text = JSON.stringify({ status: stack.status, minimumSeverity, runId: stack.runId, summary: stackSummary(stack), message: `Output exceeds inline limit. Read the COMPLETE per-pull-request findings, reviewer errors, and human judgment requests with review_report (runId ${stack.runId}), paging until nextLine is null${path ? `, or at ${path}` : ""}. No findings have been discarded from structuredContent.` });
         }
-        return { content: [{ type: "text" as const, text }], details: structuredContent, structuredContent, isError: stack.status === "incomplete" };
+        return { content: [{ type: "text" as const, text }], details: structuredContent, structuredContent: json(structuredContent), isError: stack.status === "incomplete" };
       } catch (error) {
         const structuredContent = { status: "incomplete" as const, minimumSeverity, notes: [], pullRequests: [], errors: [error instanceof Error ? error.message : String(error)] };
         return { content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }], details: structuredContent, structuredContent, isError: true };

@@ -49,7 +49,7 @@ test("commit capture covers only the child's changes and ignores the working tre
     const index = await readFile(join(r.root, ".git/index"));
     const snapshot = await captureCommits(r.root, r.parent, r.child);
     assert.equal(snapshot.baseCommit, r.parent); assert.equal(snapshot.head, r.child);
-    assert.deepEqual(snapshot.changes, [{ path: "src/a.ts", status: "modified" }]);
+    assert.deepEqual(snapshot.changes, [{ path: "src/a.ts", status: "modified", added: 1, removed: 1 }]);
     assert.equal(snapshot.current["src/a.ts"].text, "export const a = 2;\n");
     assert.equal(snapshot.current["README.md"], undefined, "unchanged files are context, not captured");
     assert.equal((await readSnapshot(snapshot, "README.md", "new")).text, "1: # Parent");

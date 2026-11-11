@@ -18,9 +18,10 @@ test("real Pi SDK denies attempted writes/shell/escape and never loads project c
     await writeFile(join(cwd, "AGENTS.md"), "PROJECT_CONTEXT_MUST_NOT_LOAD");
     await writeFile(join(cwd, "settings.json"), JSON.stringify({ extensions: [".pi/extensions/mutate.ts"] }));
     const j = job(); j.snapshot.current["escape"] = { hash: "link", mode: "120000", limitation: "symlinks are not followed" };
-    const result = await runWorker(j, sdk, typebox, cwd, model.directory);
+    const { result, spend } = await runWorker(j, sdk, typebox, cwd, model.directory);
     assert.equal(result.reviewer, "code-reviewer");
     assert.equal(model.errors.length, 0); assert.equal(model.requests.length, 5);
+    assert.equal(spend.requests, 5); assert.equal(spend.input, 5 * 1200); assert.equal(spend.output, 5 * 40);
     await assert.rejects(access(join(cwd, "SHOULD_NOT_EXIST")));
     for (const request of model.requests) {
       const names = request.tools.map((t: any) => t.function.name);
@@ -47,7 +48,7 @@ test("six fresh Pi SDK sessions overlap with no shared conversation history", { 
 test("a reviewer sees each validation error and may correct its submission", { timeout: 30000 }, async () => {
   const model = await mockModel(0, false, ["fields", "arguments"]), cwd = await mkdtemp(join(tmpdir(), "review-sdk-repair-"));
   try {
-    const result = await runWorker(job(), sdk, typebox, cwd, model.directory);
+    const { result } = await runWorker(job(), sdk, typebox, cwd, model.directory);
     assert.equal(result.reviewer, "code-reviewer");
     const toolResults = model.requests.at(-1).messages.filter((m: any) => m.role === "tool").map((m: any) => typeof m.content === "string" ? m.content : JSON.stringify(m.content));
     assert.match(toolResults[0], /result: unknown fields \[\\*"confidence\\*"\]/);

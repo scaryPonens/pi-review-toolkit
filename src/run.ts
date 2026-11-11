@@ -11,7 +11,7 @@ import { loadPolicies } from "./policy.js";
 import { selectReviewers, aggregate as aggregateReport } from "./report.js";
 import { validateResult, MAX_RESULT } from "./protocol.js";
 import { chooseBackend, quote, type Backend } from "./backend.js";
-import type { Outcome, Report, Severity, Snapshot, WorkerJob } from "./types.js";
+import type { Outcome, Report, Severity, Snapshot, Spend, WorkerJob } from "./types.js";
 
 export interface RunOptions {
   cwd: string; base?: string; pr?: number; gh?: GhRunner;
@@ -32,15 +32,16 @@ async function boundedRead(path: string, bytes: number): Promise<string | undefi
     return text;
   } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
 }
+const isSpend = (v: unknown): v is Spend => !!v && typeof v === "object" && ["input", "output", "cacheRead", "cacheWrite", "requests", "cost"].every(k => typeof (v as Record<string, unknown>)[k] === "number");
 async function waitForWorker(path: string, job: WorkerJob, signal: AbortSignal): Promise<Outcome> {
   while (true) {
     signal.throwIfAborted();
     const text = await boundedRead(path, MAX_RESULT + 20000);
     if (text !== undefined) {
       try {
-        const envelope = JSON.parse(text) as { ok?: unknown; result?: unknown; error?: unknown };
+        const envelope = JSON.parse(text) as { ok?: unknown; result?: unknown; error?: unknown; spend?: unknown };
         if (!envelope || typeof envelope !== "object" || envelope.ok !== true) throw new Error(typeof envelope?.error === "string" ? envelope.error : "Invalid worker envelope");
-        return { reviewer: job.reviewer, result: validateResult(envelope.result, job) };
+        return { reviewer: job.reviewer, result: validateResult(envelope.result, job), ...(isSpend(envelope.spend) ? { spend: envelope.spend } : {}) };
       } catch (e) { throw new Error(`Invalid/failed ${job.reviewer}: ${e instanceof Error ? e.message : String(e)}`); }
     }
     const exit = await boundedRead(`${path}.exit`, 100);

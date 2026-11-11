@@ -127,3 +127,36 @@ test("submodules are opaque: unchanged pointers are not false changes; dirty con
     assert.equal(s.current["vendor"].text, undefined);
   } finally { await r.dispose(); await sub.dispose(); }
 });
+test("generated and large data files are collapsed in the diff but stay readable; the diff opens with a file map", async () => {
+  const { collapseReason, generatedMatcher, DATA_COLLAPSE_LINES } = await import("../src/snapshot.js");
+  const r = await repo();
+  try {
+    await r.put(".gitattributes", "**/openapi.json linguist-generated=true\nvendor/* linguist-generated\n");
+    await r.git("add", "."); await r.git("commit", "-q", "-m", "attributes");
+    await r.put("src/a.ts", "export const a = 2;\n");
+    await r.put("uv.lock", "locked\n");
+    await r.put("api/openapi.json", "{\"generated\": true}\n");
+    await r.put("fixtures/big.json", Array.from({ length: DATA_COLLAPSE_LINES + 1 }, (_, i) => `"${i}"`).join(",\n") + "\n");
+    await r.put("config/small.json", "{\"a\": 1}\n");
+    const s = await capture(r.root, "main");
+    const by = Object.fromEntries(s.changes.map(c => [c.path, c]));
+    assert.equal(by["uv.lock"].collapsed, "lockfile");
+    assert.equal(by["api/openapi.json"].collapsed, "generated per .gitattributes");
+    assert.match(by["fixtures/big.json"].collapsed!, /^data file, \d+ changed lines$/);
+    assert.equal(by["config/small.json"].collapsed, undefined, "small data files stay in the diff");
+    assert.equal(by["src/a.ts"].collapsed, undefined);
+    assert.deepEqual([by["src/a.ts"].added, by["src/a.ts"].removed], [1, 1]);
+    assert.match(s.diff, /^Files: 5 changed, \+\d+ -\d+ lines, 3 collapsed/);
+    assert.match(s.diff, /  modified src\/a\.ts  \+1 -1\n/);
+    assert.match(s.diff, /  added    uv\.lock  \+1 -0  \[collapsed: lockfile\]/);
+    assert.ok(!s.diff.includes("+locked"), "collapsed hunks are omitted");
+    assert.ok(s.diff.includes("+export const a = 2;"), "other hunks remain");
+    assert.ok(s.diff.includes('"config/small.json"; mode absent -> 100644; +1 -0\n'));
+    assert.equal((await readSnapshot(s, "uv.lock", "new")).text, "1: locked", "collapsed files are still readable");
+    const generated = generatedMatcher("# comment\n*.min.js linguist-generated=true\ndocs/** linguist-vendored\n/build/out.js linguist-generated\n");
+    assert.ok(generated("a/b/x.min.js")); assert.ok(generated("build/out.js")); assert.ok(!generated("docs/x.md")); assert.ok(!generated("src/x.js"));
+    assert.equal(collapseReason("x.map", 1, () => false), "minified or source map");
+    assert.equal(collapseReason("data.csv", DATA_COLLAPSE_LINES, () => false), undefined);
+    assert.equal(collapseReason("data.csv", DATA_COLLAPSE_LINES + 1, () => false), `data file, ${DATA_COLLAPSE_LINES + 1} changed lines`);
+  } finally { await r.dispose(); }
+});

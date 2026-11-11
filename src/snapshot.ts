@@ -5,6 +5,7 @@ import { createReadStream } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { createTwoFilesPatch } from "diff";
+import picomatch from "picomatch";
 import { humanPaths } from "./types.js";
 import type { Entry, HumanPath, Snapshot, Change } from "./types.js";
 
@@ -101,9 +102,10 @@ function contextFiles(rows: Map<string, TreeRow>, captured: Set<string>): Record
   }
   return out;
 }
-const isPolicyPath = (path: string) => humanPaths.includes(path as HumanPath) || path === ".agent/reviewer-instructions.md" || path === ".agent/instructions" || path.startsWith(".agent/instructions/");
+// .gitattributes rides along with the policy files: it decides which changed files collapse in the diff.
+const isPolicyPath = (path: string) => path === ".gitattributes" || humanPaths.includes(path as HumanPath) || path === ".agent/reviewer-instructions.md" || path === ".agent/instructions" || path.startsWith(".agent/instructions/");
 async function policyPaths(root: string): Promise<string[]> {
-  const out = [...humanPaths, ".agent/reviewer-instructions.md"];
+  const out = [".gitattributes", ...humanPaths, ".agent/reviewer-instructions.md"];
   async function walk(dir: string) {
     try {
       const stat = await lstat(join(root, dir));
@@ -243,22 +245,73 @@ interface Captured {
   scope: Set<string>;
   context: Record<string, Entry>; objects: string;
 }
+/** Lockfiles and build outputs nobody reviews line by line. */
+const GENERATED_NAMES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock", "Cargo.lock", "go.sum", "composer.lock", "Gemfile.lock", "flake.lock"]);
+const DATA_EXTENSIONS = /\.(?:json|jsonl|ndjson|csv|tsv|snap|svg)$/i;
+/** A data file's hunks are collapsed once they exceed this many changed lines; small configuration files stay in the diff. */
+export const DATA_COLLAPSE_LINES = 200;
+/**
+ * Why a changed file's hunks stay out of the shared diff. Generated files (per `.gitattributes`
+ * linguist-generated, minified or lockfile names) always collapse; data files collapse only when
+ * large. The file's full text is still captured, so reviewers can read it and cite lines in it.
+ */
+export function collapseReason(path: string, changed: number, generated: (path: string) => boolean): string | undefined {
+  const name = path.split("/").pop() ?? path;
+  if (generated(path)) return "generated per .gitattributes";
+  if (GENERATED_NAMES.has(name)) return "lockfile";
+  if (/\.min\.(?:js|css)$/i.test(name) || /\.map$/i.test(name)) return "minified or source map";
+  if (DATA_EXTENSIONS.test(name) && changed > DATA_COLLAPSE_LINES) return `data file, ${changed} changed lines`;
+  return undefined;
+}
+/** `.gitattributes` patterns marked linguist-generated, matched like git does for the common forms. */
+export function generatedMatcher(gitattributes: string | undefined): (path: string) => boolean {
+  if (!gitattributes) return () => false;
+  const patterns: string[] = [];
+  for (const raw of gitattributes.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const [pattern, ...attrs] = line.split(/\s+/);
+    if (!attrs.some(a => a === "linguist-generated" || a === "linguist-generated=true")) continue;
+    // A pattern without a slash matches the basename anywhere; one with a slash is anchored at the root.
+    patterns.push(pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`);
+  }
+  if (!patterns.length) return () => false;
+  const match = picomatch(patterns, { dot: true, nocase: false });
+  return path => match(path);
+}
+const countLines = (text: string) => text.length ? text.split("\n").length - (text.endsWith("\n") ? 1 : 0) : 0;
 function assemble({ baseRef, baseCommit, head, old, current, scope, context, objects }: Captured, signal?: AbortSignal): Snapshot {
   const inScope = (entries: Record<string, Entry>) => Object.fromEntries(Object.entries(entries).filter(([path]) => scope.has(path)));
   const changes = makeChanges(inScope(old), inScope(current)), limitations: string[] = [];
-  let diff = "";
+  const generated = generatedMatcher(current[".gitattributes"]?.text ?? old[".gitattributes"]?.text);
+  const patches: string[] = [];
   for (const c of changes) {
     const a = old[c.oldPath ?? c.path], b = current[c.path];
     for (const [side, file] of [["old", a], ["new", b]] as const) if (file?.limitation) limitations.push(`${c.path} (${side}): ${file.limitation}`);
-    diff += `Change: ${c.status} ${JSON.stringify(c.oldPath ?? c.path)} -> ${JSON.stringify(c.path)}; mode ${a?.mode ?? "absent"} -> ${b?.mode ?? "absent"}\n`;
     signal?.throwIfAborted();
+    let patch = "";
     if (a?.text !== undefined || b?.text !== undefined) {
-      const patch = createTwoFilesPatch(c.oldPath ?? c.path, c.path, a?.text ?? "", b?.text ?? "", "base", "snapshot", { context: 5, timeout: 5000 });
-      if (patch === undefined) throw new Error(`Diff computation exceeded 5 seconds for ${c.path}`);
-      diff += patch;
+      const full = createTwoFilesPatch(c.oldPath ?? c.path, c.path, a?.text ?? "", b?.text ?? "", "base", "snapshot", { context: 5, timeout: 5000 });
+      if (full === undefined) throw new Error(`Diff computation exceeded 5 seconds for ${c.path}`);
+      const body = full.split("\n").slice(4); // after the ---/+++ header
+      c.added = body.filter(l => l.startsWith("+")).length;
+      c.removed = body.filter(l => l.startsWith("-")).length;
+      const reason = collapseReason(c.path, c.added + c.removed, generated);
+      if (reason) c.collapsed = reason; else patch = full;
     }
-    if (Buffer.byteLength(diff) > limits.diff) throw new Error("Review diff exceeds 8 MiB; narrow the branch changes");
+    const stats = c.added !== undefined ? `; +${c.added} -${c.removed}` : "";
+    const note = c.collapsed ? `; hunks collapsed (${c.collapsed}): read with read_snapshot if a change depends on it` : "";
+    patches.push(`Change: ${c.status} ${JSON.stringify(c.oldPath ?? c.path)} -> ${JSON.stringify(c.path)}; mode ${a?.mode ?? "absent"} -> ${b?.mode ?? "absent"}${stats}${note}\n${patch}`);
   }
+  const diff = fileMap(changes) + patches.join("");
+  if (Buffer.byteLength(diff) > limits.diff) throw new Error("Review diff exceeds 8 MiB; narrow the branch changes");
   const id = hash(JSON.stringify({ baseRef, baseCommit, head, old, current, context, changes }));
   return { id, baseRef, baseCommit, head, old, current, context, objects, changes, diff, limitations };
+}
+/** The map at the top of the shared diff: every changed file with its size, so a reviewer can go to the files its lens needs. */
+export function fileMap(changes: Change[]): string {
+  const added = changes.reduce((n, c) => n + (c.added ?? 0), 0), removed = changes.reduce((n, c) => n + (c.removed ?? 0), 0);
+  const collapsed = changes.filter(c => c.collapsed).length;
+  const rows = changes.map(c => `  ${c.status.padEnd(8)} ${c.path}${c.oldPath ? ` (from ${c.oldPath})` : ""}${c.added !== undefined ? `  +${c.added} -${c.removed}` : ""}${c.collapsed ? `  [collapsed: ${c.collapsed}]` : ""}`);
+  return `Files: ${changes.length} changed, +${added} -${removed} lines${collapsed ? `, ${collapsed} collapsed (hunks omitted below; full text readable with read_snapshot)` : ""}\n${rows.join("\n")}\n\n`;
 }

@@ -28,7 +28,7 @@ test("a repository larger than 20000 files captures only changed files and serve
   try {
     await r.put("src/a.ts", "export const needle = 3;\n");
     for (const snapshot of [await capture(r.root, "main"), await captureCommits(r.root, "main", "feature")]) {
-      assert.deepEqual(snapshot.changes, [{ path: "src/a.ts", status: "modified" }]);
+      assert.deepEqual(snapshot.changes, [{ path: "src/a.ts", status: "modified", added: 1, removed: 1 }]);
       assert.deepEqual(Object.keys(snapshot.current), ["src/a.ts"]);
       assert.equal(Object.keys(snapshot.context!).length, MAX_SEARCH_HITS + 3);
       assert.equal(snapshot.context!["src/a.ts"], undefined);
