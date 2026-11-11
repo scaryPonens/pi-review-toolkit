@@ -52,7 +52,7 @@ export function validateResult(value: unknown, job: WorkerJob): Result {
     if (j.policyReference !== undefined) {
       const ref = object(j.policyReference, `humanJudgmentRequests[${i}].policyReference`, ["file", "section", "excerpt"]);
       string(ref.section, 1000); string(ref.excerpt);
-      if (ref.file !== "HUMAN.md" || !job.policies.human?.content.includes(ref.section) || !job.policies.human.content.includes(ref.excerpt)) throw new Error("Invalid captured HUMAN.md reference");
+      if (ref.file !== job.policies.human?.path || !job.policies.human?.content.includes(ref.section) || !job.policies.human.content.includes(ref.excerpt)) throw new Error("Invalid captured HUMAN.md reference");
     }
   }
   return value as Result;

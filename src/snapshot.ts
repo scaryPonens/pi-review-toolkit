@@ -5,7 +5,8 @@ import { createReadStream } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { createTwoFilesPatch } from "diff";
-import type { Entry, Snapshot, Change } from "./types.js";
+import { humanPaths } from "./types.js";
+import type { Entry, HumanPath, Snapshot, Change } from "./types.js";
 
 const exec = promisify(execFile);
 export const limits = { file: 1024 * 1024, total: 64 * 1024 * 1024, files: 20000, diff: 8 * 1024 * 1024, instruction: 64 * 1024, policies: 256 * 1024, instructionFiles: 128, applicability: 20000 };
@@ -100,9 +101,9 @@ function contextFiles(rows: Map<string, TreeRow>, captured: Set<string>): Record
   }
   return out;
 }
-const isPolicyPath = (path: string) => path === "HUMAN.md" || path === ".agent/reviewer-instructions.md" || path === ".agent/instructions" || path.startsWith(".agent/instructions/");
+const isPolicyPath = (path: string) => humanPaths.includes(path as HumanPath) || path === ".agent/reviewer-instructions.md" || path === ".agent/instructions" || path.startsWith(".agent/instructions/");
 async function policyPaths(root: string): Promise<string[]> {
-  const out = ["HUMAN.md", ".agent/reviewer-instructions.md"];
+  const out = [...humanPaths, ".agent/reviewer-instructions.md"];
   async function walk(dir: string) {
     try {
       const stat = await lstat(join(root, dir));

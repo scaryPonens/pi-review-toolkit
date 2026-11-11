@@ -1,3 +1,6 @@
+/** Where HUMAN.md may live: `.agents/HUMAN.md` is preferred; the repository root is accepted. */
+export type HumanPath = ".agents/HUMAN.md" | "HUMAN.md";
+export const humanPaths: readonly HumanPath[] = [".agents/HUMAN.md", "HUMAN.md"];
 import type { PullRequest } from "./pr.js";
 export const reviewers = ["code-reviewer", "pr-test-analyzer", "silent-failure-hunter", "type-design-analyzer", "comment-analyzer", "code-simplifier"] as const;
 export type Reviewer = typeof reviewers[number];
@@ -17,7 +20,7 @@ export interface Snapshot {
   changes: Change[]; diff: string; limitations: string[];
 }
 export interface Instruction { path: string; content: string; appliesTo: string[]; global: boolean }
-export interface Policies { instructions: Instruction[]; human?: { path: "HUMAN.md"; content: string; hash: string }; errors: string[] }
+export interface Policies { instructions: Instruction[]; human?: { path: HumanPath; content: string; hash: string }; errors: string[] }
 export interface Finding {
   severity: Severity; file: string; line: number; side: "old" | "new";
   description: string; suggestedResolution: string;
@@ -25,7 +28,7 @@ export interface Finding {
 }
 export interface Judgment {
   description: string; question: string; rationale: string; file?: string; line?: number;
-  policyReference?: { file: "HUMAN.md"; section: string; excerpt: string };
+  policyReference?: { file: HumanPath; section: string; excerpt: string };
 }
 export interface Result {
   schemaVersion: 1; runId: string; snapshotId: string; reviewer: Reviewer;

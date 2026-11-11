@@ -21,11 +21,11 @@ export async function repo() {
 }
 export const textEntry = (text: string): Entry => ({ hash: hash(text), mode: "100644", text });
 export function snapshot(): Snapshot {
-  return { id: "snapshot", baseRef: "main", baseCommit: "base", head: "head", old: { "src/a.ts": textEntry("export const a = 1;\n"), "old.ts": textEntry("old\n") }, current: { "src/a.ts": textEntry("export const a = 2;\n"), "HUMAN.md": textEntry("# Compatibility\nAsk before changing a public API.\n") }, changes: [{ path: "src/a.ts", status: "modified" }, { path: "old.ts", status: "deleted" }], diff: "fixture diff\n", limitations: [] };
+  return { id: "snapshot", baseRef: "main", baseCommit: "base", head: "head", old: { "src/a.ts": textEntry("export const a = 1;\n"), "old.ts": textEntry("old\n") }, current: { "src/a.ts": textEntry("export const a = 2;\n"), ".agents/HUMAN.md": textEntry("# Compatibility\nAsk before changing a public API.\n") }, changes: [{ path: "src/a.ts", status: "modified" }, { path: "old.ts", status: "deleted" }], diff: "fixture diff\n", limitations: [] };
 }
 export function job(reviewer: Reviewer = "code-reviewer"): WorkerJob {
-  return { runId: "run", snapshot: snapshot(), reviewer, minimumSeverity: "medium", policies: { instructions: [], human: { path: "HUMAN.md", content: "# Compatibility\nAsk before changing a public API.\n", hash: "policy" }, errors: [] }, provider: "fixture", model: "fixture" };
+  return { runId: "run", snapshot: snapshot(), reviewer, minimumSeverity: "medium", policies: { instructions: [], human: { path: ".agents/HUMAN.md", content: "# Compatibility\nAsk before changing a public API.\n", hash: "policy" }, errors: [] }, provider: "fixture", model: "fixture" };
 }
 export function result(j = job()): Result {
-  return { schemaVersion: 1, runId: j.runId, snapshotId: j.snapshot.id, reviewer: j.reviewer, findings: [{ severity: "medium", file: "src/a.ts", line: 1, side: "new", description: "A supported issue", suggestedResolution: "Fix the issue" }], humanJudgmentRequests: [{ description: "API decision", question: "Is the change acceptable?", rationale: "Changes public API", file: "src/a.ts", line: 1, policyReference: { file: "HUMAN.md", section: "Compatibility", excerpt: "Ask before changing a public API." } }] };
+  return { schemaVersion: 1, runId: j.runId, snapshotId: j.snapshot.id, reviewer: j.reviewer, findings: [{ severity: "medium", file: "src/a.ts", line: 1, side: "new", description: "A supported issue", suggestedResolution: "Fix the issue" }], humanJudgmentRequests: [{ description: "API decision", question: "Is the change acceptable?", rationale: "Changes public API", file: "src/a.ts", line: 1, policyReference: { file: ".agents/HUMAN.md", section: "Compatibility", excerpt: "Ask before changing a public API." } }] };
 }

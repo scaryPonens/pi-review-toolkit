@@ -86,7 +86,7 @@ export function renderReport(report: Report): string {
     const o = report.outcomes.find(o => o.reviewer === s.reviewer);
     lines.push(`- ${s.reviewer}: ${!s.selected ? "skipped" : o?.result && !o.error ? "completed" : "failed"} — ${o?.error ?? s.reason}`);
   }
-  lines.push(`HUMAN.md: ${report.policies.human ? `present (${report.policies.human.hash})` : "absent or unavailable; see limitations"}`);
+  lines.push(`HUMAN.md: ${report.policies.human ? `present at ${report.policies.human.path} (${report.policies.human.hash})` : "absent or unavailable; see limitations"}`);
   for (const i of report.policies.instructions) {
     lines.push(`Instruction: ${i.path} — ${i.global ? "repository-wide" : i.appliesTo.length ? "path-specific" : "no matching changed paths"}`);
     if (!i.global) for (const path of i.appliesTo) lines.push(`  Applies to: ${path}`);
@@ -103,7 +103,7 @@ export function renderReport(report: Report): string {
   report.judgments.forEach((j, i) => {
     lines.push(`${i + 1}. ${j.description}`, `   Reviewers: ${j.reviewers.join(", ")}`, `   Question: ${j.question}`, `   Reason: ${j.rationale}`);
     if (j.file) lines.push(`   Location: ${j.file}${j.line ? `:${j.line}` : ""} (new)`);
-    if (j.policyReference) lines.push(`   Policy: HUMAN.md — ${j.policyReference.section}`, `   Excerpt: ${j.policyReference.excerpt}`);
+    if (j.policyReference) lines.push(`   Policy: ${j.policyReference.file} — ${j.policyReference.section}`, `   Excerpt: ${j.policyReference.excerpt}`);
   });
   if (report.humanJudgment === "required") lines.push("Handoff: Calling agent must notify the human operator and obtain required judgment/approval. Notification and approval have NOT occurred through this extension.");
   if (report.limitations.length) lines.push("", "Coverage limitations / failures:", ...report.limitations.map(s => `- ${s}`));
