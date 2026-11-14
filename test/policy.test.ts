@@ -29,8 +29,37 @@ test("bad front matter, duplicate keys, missing/empty applyTo and unsupported gl
 });
 test("oversized or nontext policies are explicit failures rather than ignored/truncated", () => {
   const s = snapshot();
-  s.current["HUMAN.md"] = textEntry("x".repeat(65537));
+  s.current[".agents/HUMAN.md"] = textEntry("x".repeat(65537));
   s.current[".agent/instructions/bad.instructions.md"] = { hash: "bad", mode: "120000", limitation: "symlinks are not followed" };
   const p = loadPolicies(s); assert.equal(p.human, undefined); assert.equal(p.errors.length, 2);
   assert.match(p.errors.join("\n"), /64 KiB/);
+});
+
+test("HUMAN.md may live under .agents, and not in both places", () => {
+  const s = snapshot();
+  delete s.current[".agents/HUMAN.md"];
+  s.current["HUMAN.md"] = textEntry("# Root\nAsk.\n");
+  assert.equal(loadPolicies(s).human?.path, "HUMAN.md");
+  s.current[".agents/HUMAN.md"] = textEntry("# Nested\nAsk.\n");
+  const both = loadPolicies(s);
+  assert.equal(both.human?.path, ".agents/HUMAN.md");
+  assert.ok(both.errors.some(e => /both/.test(e)));
+});
+
+test("the operator's HUMAN.md applies only when the repository has none", async () => {
+  const { withUserHuman } = await import("../src/policy.js");
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const agentDir = mkdtempSync(join(tmpdir(), "agent-"));
+  const s = snapshot();
+  delete s.current[".agents/HUMAN.md"];
+  assert.equal(withUserHuman(loadPolicies(s), agentDir).human, undefined);
+  writeFileSync(join(agentDir, "HUMAN.md"), "# Mine\nAsk me.\n");
+  const mine = withUserHuman(loadPolicies(s), agentDir);
+  assert.equal(mine.human?.path, join(agentDir, "HUMAN.md"));
+  assert.equal(mine.human?.content, "# Mine\nAsk me.\n");
+  // A repository file wins whole.
+  const repo = withUserHuman(loadPolicies(snapshot()), agentDir);
+  assert.equal(repo.human?.path, ".agents/HUMAN.md");
 });

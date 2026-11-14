@@ -5,9 +5,9 @@ const exec = promisify(execFile);
 export type CommandRunner = (binary: string, args: string[]) => Promise<string>;
 export const command: CommandRunner = async (binary, args) => (await exec(binary, args, { timeout: 15000, maxBuffer: 1024 * 1024 })).stdout;
 export const quote = (value: string) => `'${value.replace(/'/g, `'"'"'`)}'`;
-function parseBackend<T = unknown>(text: string): T {
+function parseBackend<T = unknown>(text: string, name = "backend"): T {
   try { return JSON.parse(text) as T; }
-  catch (e) { throw new Error(`Malformed backend response: ${e instanceof Error ? e.message : String(e)}`); }
+  catch (e) { throw new Error(`Malformed ${name} response: ${e instanceof Error ? e.message : String(e)}`); }
 }
 interface HerdrResponse {
   result?: {
@@ -28,11 +28,18 @@ export async function chooseBackend(run: CommandRunner = command, env = process.
     if (!/herdr 0\.8\./.test(version)) throw new Error(`Unsupported Herdr version: ${version.trim()}; tested 0.8.x`);
     return new HerdrBackend(env.HERDR_PANE_ID, run, env.HERDR_WORKSPACE_ID);
   }
+  if (env.ORCA_TERMINAL_HANDLE) {
+    // Inside an Orca terminal. As with Herdr, a failing Orca CLI is an error, not a reason to fall back to tmux.
+    const cli = orcaCli(env);
+    const backend = new OrcaBackend(cli, run);
+    await backend.verify(env.ORCA_TERMINAL_HANDLE);
+    return backend;
+  }
   try {
     const version = await run("tmux", ["-V"]);
     if (!/^tmux (?:3\.[2-9]|[4-9]\.)/.test(version.trim())) throw new Error("tmux >=3.2 is required");
     return new TmuxBackend(run);
-  } catch (e) { throw new Error(`No supported execution backend. Use Herdr 0.8.x inside a managed pane, or install tmux >=3.2. ${e instanceof Error ? e.message : String(e)}`); }
+  } catch (e) { throw new Error(`No supported execution backend. Use Herdr 0.8.x inside a managed pane, run Pi in an Orca terminal, or install tmux >=3.2. ${e instanceof Error ? e.message : String(e)}`); }
 }
 abstract class OwnedBackend implements Backend {
   abstract name: string;
@@ -115,5 +122,69 @@ export class TmuxBackend extends OwnedBackend {
         if (!/no server running|no sessions/i.test(String(probe))) throw probe;
       }
     }
+  }
+}
+
+/** The Orca CLI for this session, resolved as Orca's own guide prescribes. */
+export function orcaCli(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.ORCA_CLI_COMMAND) return env.ORCA_CLI_COMMAND;
+  if (env.ORCA_DEV_REPO_ROOT) return "orca-dev";
+  return "orca";
+}
+interface OrcaResponse {
+  ok?: boolean;
+  error?: { code?: string; message?: string };
+  result?: { terminal?: { handle?: string; connected?: boolean }; split?: { handle?: string } };
+}
+/**
+ * Reviewers run in one dedicated Orca tab, opened without taking focus. The first reviewer creates the
+ * tab and the rest split its largest pane, so the invoking terminal is never resized. Closing the last
+ * pane removes the tab.
+ */
+export class OrcaBackend extends OwnedBackend {
+  name = "orca";
+  private serial: Promise<unknown> = Promise.resolve();
+  /** Relative pane sizes, tracked locally so each split halves the largest pane along its longer side. */
+  private panes = new Map<string, { width: number; height: number }>();
+  constructor(private cli: string, run: CommandRunner = command) { super(run); }
+  private async orca(args: string[]): Promise<OrcaResponse> {
+    const response = parseBackend<OrcaResponse>(await this.run(this.cli, [...args, "--json"]), "Orca");
+    if (response.ok === false) throw new Error(`orca ${args.slice(0, 2).join(" ")} failed: ${response.error?.code ?? "error"}: ${response.error?.message ?? "no message"}`);
+    return response;
+  }
+  /** Confirm the Orca CLI answers for the invoking terminal before any reviewer starts. */
+  async verify(caller: string) { await this.orca(["terminal", "show", "--terminal", caller]); }
+  async start(shell: string, cwd: string, signal?: AbortSignal): Promise<string> {
+    // Orca types --command into the user's login shell, so run the trusted command under /bin/sh explicitly.
+    const startup = `/bin/sh -c ${quote(`cd ${quote(cwd)} || exit 1; ${shell}`)}`;
+    const operation = this.serial.then(async () => {
+      signal?.throwIfAborted();
+      let id: unknown, size = { width: 2, height: 1 };
+      const live = [...this.panes].filter(([pane]) => this.owned.has(pane));
+      if (!live.length) {
+        id = (await this.orca(["terminal", "create", "--title", "pi-review", "--command", startup])).result?.terminal?.handle;
+      } else {
+        const [target, rect] = live.sort(([, a], [, b]) => b.width * b.height - a.width * a.height)[0];
+        const vertical = rect.width > rect.height;
+        size = vertical ? { width: rect.width / 2, height: rect.height } : { width: rect.width, height: rect.height / 2 };
+        id = (await this.orca(["terminal", "split", "--terminal", target, "--direction", vertical ? "vertical" : "horizontal", "--command", startup])).result?.split?.handle;
+        this.panes.set(target, size);
+      }
+      if (typeof id !== "string" || !/^term_[\w-]{1,120}$/.test(id) || this.owned.has(id)) throw new Error("Invalid/duplicate Orca terminal handle in creation response");
+      this.owned.add(id);
+      this.panes.set(id, size);
+      return id;
+    });
+    this.serial = operation.catch(() => {});
+    return operation;
+  }
+  async destroy(id: string) {
+    try { await this.orca(["terminal", "close", "--terminal", id]); }
+    catch (e) {
+      // An owned pane that is already gone is clean; verify that rather than suppressing the error.
+      const shown = await this.orca(["terminal", "show", "--terminal", id]).catch(() => undefined);
+      if (shown?.result?.terminal?.connected !== false) throw e;
+    }
+    this.panes.delete(id);
   }
 }

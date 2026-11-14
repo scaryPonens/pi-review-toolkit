@@ -1,7 +1,11 @@
 import { parseDocument } from "yaml";
 import picomatch from "picomatch";
 import { limits } from "./snapshot.js";
-import type { Policies, Snapshot } from "./types.js";
+import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { humanPaths, USER_HUMAN } from "./types.js";
+import type { HumanPath, Policies, Snapshot } from "./types.js";
 
 export const globOptions = Object.freeze({ dot: true, nocase: false, nonegate: true, noext: true, nobrace: true, posixSlashes: true });
 export function patterns(value: unknown): string[] {
@@ -18,7 +22,7 @@ export function loadPolicies(snapshot: Snapshot): Policies {
   let total = 0, discovered = 0, applicability = 0;
   for (const path of Object.keys(snapshot.current).sort()) {
     const global = path === ".agent/reviewer-instructions.md";
-    const human = path === "HUMAN.md";
+    const human = humanPaths.includes(path as HumanPath);
     const specific = path.startsWith(".agent/instructions/") && path.endsWith(".instructions.md");
     const blocked = path === ".agent/instructions" || (path.startsWith(".agent/instructions/") && snapshot.current[path].mode === "120000");
     if (!global && !human && !specific && !blocked) continue;
@@ -29,7 +33,11 @@ export function loadPolicies(snapshot: Snapshot): Policies {
       total += Buffer.byteLength(file.text);
       if (Buffer.byteLength(file.text) > limits.instruction) throw new Error("exceeds 64 KiB policy file limit");
       if (total > limits.policies) throw new Error("combined policies exceed 256 KiB");
-      if (human) { policies.human = { path: "HUMAN.md", content: file.text, hash: file.hash }; continue; }
+      if (human) {
+        if (policies.human) throw new Error(`HUMAN.md is present at both ${policies.human.path} and ${path}; keep one`);
+        policies.human = { path: path as HumanPath, content: file.text, hash: file.hash };
+        continue;
+      }
       if (global) { policies.instructions.push({ path, content: file.text, global: true, appliesTo: [] }); continue; }
       const match = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(file.text);
       if (!match) throw new Error("missing YAML front matter");
@@ -44,5 +52,26 @@ export function loadPolicies(snapshot: Snapshot): Policies {
       policies.instructions.push({ path, content: file.text.slice(match[0].length), global: false, appliesTo: [...new Set(appliesTo)].sort() });
     } catch (e) { policies.errors.push(`${path}: ${e instanceof Error ? e.message : String(e)}`); }
   }
+  return policies;
+}
+
+/**
+ * The operator's own HUMAN.md, `<agentDir>/HUMAN.md`, applies only when the snapshot carries none:
+ * a repository's file replaces it whole. It is read at run time, not captured with the snapshot, so
+ * its path is recorded as the absolute file and its hash with it. Absent is normal.
+ */
+export function withUserHuman(policies: Policies, agentDir: string): Policies {
+  if (policies.human || policies.errors.length) return policies;
+  const path = join(agentDir, USER_HUMAN);
+  let content: string;
+  try {
+    if (statSync(path).size > limits.instruction) { policies.errors.push(`${path}: exceeds 64 KiB policy file limit`); return policies; }
+    content = readFileSync(path, "utf8");
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT") return policies;
+    policies.errors.push(`${path}: ${e instanceof Error ? e.message : String(e)}`);
+    return policies;
+  }
+  policies.human = { path, content, hash: createHash("sha256").update(content).digest("hex") };
   return policies;
 }

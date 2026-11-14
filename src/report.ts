@@ -1,15 +1,21 @@
-import { reviewers, severities, type Selection, type Snapshot, type Policies, type Severity, type Outcome, type Report } from "./types.js";
-export const usage = "/review [--base <git-ref>] [--min-severity low|medium|high|critical]";
-export function parseArgs(input: string): { base?: string; minimumSeverity: Severity } {
+import { reviewers, severities, type Selection, type Snapshot, type Policies, type Severity, type Outcome, type Report, type Spend } from "./types.js";
+export const usage = "/review [--pr <number>] [--base <git-ref>] [--min-severity low|medium|high|critical]";
+export interface ReviewArgs { base?: string; pr?: number; minimumSeverity: Severity }
+export function parseArgs(input: string): ReviewArgs {
   // Refs and severities cannot contain whitespace, so shell evaluation/quoting is unnecessary.
   const tokens = input.trim().split(/\s+/).filter(Boolean);
-  const options: { base?: string; minimumSeverity: Severity } = { minimumSeverity: "medium" };
+  const options: ReviewArgs = { minimumSeverity: "medium" };
   const seen = new Set<string>();
   for (let i = 0; i < tokens.length; i += 2) {
     const flag = tokens[i], value = tokens[i + 1];
-    if (!["--base", "--min-severity"].includes(flag) || seen.has(flag) || !value || value.startsWith("-")) throw new Error(`Invalid or missing argument. Usage: ${usage}`);
+    if (!["--base", "--pr", "--min-severity"].includes(flag) || seen.has(flag) || !value || value.startsWith("-")) throw new Error(`Invalid or missing argument. Usage: ${usage}`);
     seen.add(flag);
     if (flag === "--base") options.base = value;
+    else if (flag === "--pr") {
+      const digits = value.replace(/^#/, "");
+      if (!/^[1-9]\d{0,9}$/.test(digits)) throw new Error(`Invalid pull request number ${JSON.stringify(value)}. Usage: ${usage}`);
+      options.pr = Number(digits);
+    }
     else if (severities.includes(value as Severity)) options.minimumSeverity = value as Severity;
     else throw new Error(`Invalid severity ${JSON.stringify(value)}. Usage: ${usage}`);
   }
@@ -61,22 +67,35 @@ export function aggregate(runId: string, snapshot: Snapshot, policies: Policies,
     status: incomplete ? "incomplete" : !snapshot.changes.length ? "no-changes" : findings.length ? "findings" : "passed",
     humanJudgment: judgments.length ? "required" : incomplete ? "undetermined" : "not-identified",
     selection, outcomes, policies, findings, judgments, limitations,
+    changes: snapshot.changes.map(c => ({ ...c })),
   };
+}
+const tokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(n >= 100000 ? 0 : 1)}k` : String(n);
+export const spendLine = (s: Spend) => `${s.requests} requests, ${tokens(s.input + s.cacheRead + s.cacheWrite)} in (${tokens(s.cacheRead)} cached), ${tokens(s.output)} out${s.cost ? `, ~$${s.cost.toFixed(2)}` : ""}`;
+export function totalSpend(outcomes: Outcome[]): Spend | undefined {
+  const spends = outcomes.map(o => o.spend).filter((s): s is Spend => !!s);
+  if (!spends.length) return undefined;
+  return spends.reduce((t, s) => ({ input: t.input + s.input, output: t.output + s.output, cacheRead: t.cacheRead + s.cacheRead, cacheWrite: t.cacheWrite + s.cacheWrite, requests: t.requests + s.requests, cost: t.cost + s.cost }));
 }
 export function renderReport(report: Report): string {
   const lines = [
     report.status === "no-changes" ? "No changes to review (no reviewers launched)." : `Review status: ${report.status}`,
     `Minimum severity: ${report.minimumSeverity.toUpperCase()}`,
     `Human judgment: ${report.humanJudgment}`,
-    `Base: ${report.baseRef} (${report.baseCommit})`, `Snapshot: ${report.snapshotId}`,
-    "This report covers the captured snapshot, not subsequent working-tree edits. Technical success is not human approval.",
+    ...(report.pullRequest ? [`Pull request: #${report.pullRequest.number} (${report.pullRequest.state}) ${report.pullRequest.url}`, `Head: ${report.pullRequest.headRefName} (${report.pullRequest.headOid})`, `Base: ${report.pullRequest.baseRefName} (${report.pullRequest.baseOid}); merge base ${report.baseCommit}`] : [`Base: ${report.baseRef} (${report.baseCommit})`]),
+    `Snapshot: ${report.snapshotId}`,
+    report.pullRequest
+      ? "This report covers the pull request's head commit against its base branch, not the local working tree. Technical success is not human approval."
+      : "This report covers the captured snapshot, not subsequent working-tree edits. Technical success is not human approval.",
     `Reviewers: ${report.outcomes.filter(o => o.result && !o.error).length} completed / ${report.selection.filter(s => s.selected).length} selected`,
   ];
   for (const s of report.selection) {
     const o = report.outcomes.find(o => o.reviewer === s.reviewer);
-    lines.push(`- ${s.reviewer}: ${!s.selected ? "skipped" : o?.result && !o.error ? "completed" : "failed"} — ${o?.error ?? s.reason}`);
+    lines.push(`- ${s.reviewer}: ${!s.selected ? "skipped" : o?.result && !o.error ? "completed" : "failed"} — ${o?.error ?? s.reason}${o?.spend ? ` — ${spendLine(o.spend)}` : ""}`);
   }
-  lines.push(`HUMAN.md: ${report.policies.human ? `present (${report.policies.human.hash})` : "absent or unavailable; see limitations"}`);
+  const total = totalSpend(report.outcomes);
+  if (total) lines.push(`Spend: ${spendLine(total)} across ${report.outcomes.filter(o => o.spend).length} reviewers`);
+  lines.push(`HUMAN.md: ${report.policies.human ? `present at ${report.policies.human.path} (${report.policies.human.hash})` : "absent or unavailable; see limitations"}`);
   for (const i of report.policies.instructions) {
     lines.push(`Instruction: ${i.path} — ${i.global ? "repository-wide" : i.appliesTo.length ? "path-specific" : "no matching changed paths"}`);
     if (!i.global) for (const path of i.appliesTo) lines.push(`  Applies to: ${path}`);
@@ -93,7 +112,7 @@ export function renderReport(report: Report): string {
   report.judgments.forEach((j, i) => {
     lines.push(`${i + 1}. ${j.description}`, `   Reviewers: ${j.reviewers.join(", ")}`, `   Question: ${j.question}`, `   Reason: ${j.rationale}`);
     if (j.file) lines.push(`   Location: ${j.file}${j.line ? `:${j.line}` : ""} (new)`);
-    if (j.policyReference) lines.push(`   Policy: HUMAN.md — ${j.policyReference.section}`, `   Excerpt: ${j.policyReference.excerpt}`);
+    if (j.policyReference) lines.push(`   Policy: ${j.policyReference.file} — ${j.policyReference.section}`, `   Excerpt: ${j.policyReference.excerpt}`);
   });
   if (report.humanJudgment === "required") lines.push("Handoff: Calling agent must notify the human operator and obtain required judgment/approval. Notification and approval have NOT occurred through this extension.");
   if (report.limitations.length) lines.push("", "Coverage limitations / failures:", ...report.limitations.map(s => `- ${s}`));

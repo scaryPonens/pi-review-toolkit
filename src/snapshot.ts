@@ -5,7 +5,9 @@ import { createReadStream } from "node:fs";
 import { lstat, readFile, readdir, readlink, realpath } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { createTwoFilesPatch } from "diff";
-import type { Entry, Snapshot, Change } from "./types.js";
+import picomatch from "picomatch";
+import { humanPaths } from "./types.js";
+import type { Entry, HumanPath, Snapshot, Change } from "./types.js";
 
 const exec = promisify(execFile);
 export const limits = { file: 1024 * 1024, total: 64 * 1024 * 1024, files: 20000, diff: 8 * 1024 * 1024, instruction: 64 * 1024, policies: 256 * 1024, instructionFiles: 128, applicability: 20000 };
@@ -45,7 +47,7 @@ async function hashLargeBlob(root: string, oid: string): Promise<string> {
     return digest.digest("hex");
   } finally { clearTimeout(timer); if (child.exitCode === null) child.kill("SIGKILL"); }
 }
-function entry(data: Buffer, mode: string): Entry {
+export function entry(data: Buffer, mode: string): Entry {
   const digest = hash(data);
   if (mode === "120000") return { hash: digest, mode, limitation: "symlinks are not followed" };
   if (data.length > limits.file) return { hash: digest, mode, limitation: "file exceeds 1 MiB" };
@@ -55,28 +57,55 @@ function entry(data: Buffer, mode: string): Entry {
   if (text.startsWith("version https://git-lfs.github.com/spec/v1\n")) return { hash: digest, mode, limitation: "Git LFS pointer (not hydrated)" };
   return { hash: digest, mode, text };
 }
-async function baseFiles(root: string, commit: string, signal?: AbortSignal): Promise<Record<string, Entry>> {
+interface TreeRow { mode: string; kind: string; oid: string; size: number }
+/** One `git ls-tree` listing of a commit: metadata only, no file contents. */
+async function treeRows(root: string, commit: string): Promise<Map<string, TreeRow>> {
+  const rows = new Map<string, TreeRow>();
+  for (const row of (await git(root, ["ls-tree", "-rlz", "--full-tree", commit])).toString("utf8").split("\0")) {
+    if (!row) continue;
+    const tab = row.indexOf("\t");
+    const [mode, kind, oid, size] = row.slice(0, tab).split(/ +/);
+    rows.set(row.slice(tab + 1), { mode, kind, oid, size: Number(size) });
+  }
+  return rows;
+}
+/** Read the full contents of the given paths from a commit's tree. */
+async function treeFiles(root: string, rows: Map<string, TreeRow>, paths: Iterable<string>, signal?: AbortSignal): Promise<Record<string, Entry>> {
   const out: Record<string, Entry> = Object.create(null);
-  const rows = (await git(root, ["ls-tree", "-rz", "--full-tree", commit])).toString("utf8").split("\0").filter(Boolean);
-  if (rows.length > limits.files) throw new Error("Repository exceeds 20000 files");
   let total = 0;
-  for (const row of rows) {
+  for (const path of paths) {
+    const row = rows.get(path);
+    if (!row) continue;
     signal?.throwIfAborted();
-    const tab = row.indexOf("\t"), path = row.slice(tab + 1);
     if (!validPath(path)) throw new Error(`Unsupported repository path: ${JSON.stringify(path)}`);
-    const [mode, kind, oid] = row.slice(0, tab).split(" ");
+    const { mode, kind, oid, size } = row;
     if (kind === "commit") { out[path] = { hash: oid, mode, limitation: "submodule content is unsupported" }; continue; }
-    const size = Number(await textGit(root, ["cat-file", "-s", oid]));
     total += size;
-    if (total > limits.total) throw new Error("Base repository content exceeds 64 MiB capture limit");
+    if (total > limits.total) throw new Error("Changed repository content exceeds 64 MiB capture limit");
     if (size > limits.file) { out[path] = { hash: await hashLargeBlob(root, oid), mode, limitation: "file exceeds 1 MiB" }; continue; }
-    const data = await git(root, ["cat-file", "blob", oid]);
-    out[path] = entry(data, mode);
+    out[path] = entry(await git(root, ["cat-file", "blob", oid]), mode);
   }
   return out;
 }
+/**
+ * Unchanged files, identical on both sides, recorded by blob id only. Reviewers read and search them
+ * from git objects on demand, so repository size does not bound the snapshot.
+ */
+function contextFiles(rows: Map<string, TreeRow>, captured: Set<string>): Record<string, Entry> {
+  const out: Record<string, Entry> = Object.create(null);
+  for (const [path, { mode, kind, oid, size }] of rows) {
+    if (captured.has(path) || !validPath(path)) continue;
+    if (kind === "commit") out[path] = { hash: oid, mode, limitation: "submodule content is unsupported" };
+    else if (mode === "120000") out[path] = { hash: oid, mode, limitation: "symlinks are not followed" };
+    else if (size > limits.file) out[path] = { hash: oid, mode, limitation: "file exceeds 1 MiB" };
+    else out[path] = { hash: oid, mode, blob: oid };
+  }
+  return out;
+}
+// .gitattributes rides along with the policy files: it decides which changed files collapse in the diff.
+const isPolicyPath = (path: string) => path === ".gitattributes" || humanPaths.includes(path as HumanPath) || path === ".agent/reviewer-instructions.md" || path === ".agent/instructions" || path.startsWith(".agent/instructions/");
 async function policyPaths(root: string): Promise<string[]> {
-  const out = ["HUMAN.md", ".agent/reviewer-instructions.md"];
+  const out = [".gitattributes", ...humanPaths, ".agent/reviewer-instructions.md"];
   async function walk(dir: string) {
     try {
       const stat = await lstat(join(root, dir));
@@ -92,8 +121,14 @@ async function policyPaths(root: string): Promise<string[]> {
   await walk(".agent/instructions");
   return out;
 }
-async function currentFiles(root: string, signal?: AbortSignal): Promise<{ entries: Record<string, Entry>; scopePaths: string[] }> {
-  const listed = (await git(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"])).toString("utf8").split("\0").filter(Boolean);
+/** Capture working-tree contents of the paths that differ from the base commit, plus policy files. */
+async function currentFiles(root: string, baseCommit: string, signal?: AbortSignal): Promise<{ entries: Record<string, Entry>; scopePaths: string[] }> {
+  const split = (data: Buffer) => data.toString("utf8").split("\0").filter(Boolean);
+  // `git diff <commit>` compares the commit with the working tree (staged and unstaged); --no-optional-locks keeps the index unwritten.
+  const listed = [
+    ...split(await git(root, ["diff", "--no-renames", "--no-ext-diff", "--ignore-submodules=none", "--name-only", "-z", baseCommit, "--"])),
+    ...split(await git(root, ["ls-files", "-z", "--others", "--exclude-standard"])),
+  ];
   const staged = (await git(root, ["ls-files", "--stage", "-z"])).toString("utf8").split("\0");
   const gitlinks = new Map<string, string>();
   for (const row of staged) {
@@ -101,7 +136,7 @@ async function currentFiles(root: string, signal?: AbortSignal): Promise<{ entri
     if (fields[0] === "160000") gitlinks.set(row.slice(tab + 1), fields[1]);
   }
   const paths = [...new Set([...listed, ...await policyPaths(root)])].sort();
-  if (paths.length > limits.files) throw new Error("Repository exceeds 20000 files");
+  if (paths.length > limits.files) throw new Error("More than 20000 changed files");
   const out: Record<string, Entry> = Object.create(null);
   let total = 0;
   for (const path of paths) {
@@ -172,28 +207,139 @@ export async function capture(root: string, baseRef: string, signal?: AbortSigna
     const before = await fingerprint(root);
     const head = await textGit(root, ["rev-parse", "HEAD"]);
     const baseCommit = await textGit(root, ["merge-base", baseRef, head]);
-    const old = await baseFiles(root, baseCommit, signal);
-    const captured = await currentFiles(root, signal);
+    const captured = await currentFiles(root, baseCommit, signal);
     const current = captured.entries;
-    const verify = await currentFiles(root, signal);
+    const verify = await currentFiles(root, baseCommit, signal);
     if (before !== await fingerprint(root) || hash(JSON.stringify(captured)) !== hash(JSON.stringify(verify)) || baseCommit !== await textGit(root, ["merge-base", baseRef, "HEAD"])) continue;
     signal?.throwIfAborted();
-    const changes = makeChanges(old, Object.fromEntries(captured.scopePaths.filter(path => current[path]).map(path => [path, current[path]]))), limitations: string[] = [];
-    let diff = "";
-    for (const c of changes) {
-      const a = old[c.oldPath ?? c.path], b = current[c.path];
-      for (const [side, file] of [["old", a], ["new", b]] as const) if (file?.limitation) limitations.push(`${c.path} (${side}): ${file.limitation}`);
-      diff += `Change: ${c.status} ${JSON.stringify(c.oldPath ?? c.path)} -> ${JSON.stringify(c.path)}; mode ${a?.mode ?? "absent"} -> ${b?.mode ?? "absent"}\n`;
-      signal?.throwIfAborted();
-      if (a?.text !== undefined || b?.text !== undefined) {
-        const patch = createTwoFilesPatch(c.oldPath ?? c.path, c.path, a?.text ?? "", b?.text ?? "", "base", "snapshot", { context: 5, timeout: 5000 });
-        if (patch === undefined) throw new Error(`Diff computation exceeded 5 seconds for ${c.path}`);
-        diff += patch;
-      }
-      if (Buffer.byteLength(diff) > limits.diff) throw new Error("Review diff exceeds 8 MiB; narrow the branch changes");
-    }
-    const id = hash(JSON.stringify({ baseRef, baseCommit, head, old, current, changes }));
-    return { id, baseRef, baseCommit, head, old, current, changes, diff, limitations };
+    const rows = await treeRows(root, baseCommit);
+    const paths = new Set([...Object.keys(current), ...captured.scopePaths]);
+    const old = await treeFiles(root, rows, paths, signal);
+    return assemble({ baseRef, baseCommit, head, old, current, scope: new Set(captured.scopePaths), context: contextFiles(rows, paths), objects: await gitObjects(root) }, signal);
   }
   throw new Error("Working tree, index, HEAD, or base changed during capture (3 attempts); retry when edits settle");
+}
+/** Capture the changes between two commits from git objects alone; the working tree, index, and HEAD are not read. */
+export async function captureCommits(root: string, baseRef: string, headRef: string, signal?: AbortSignal): Promise<Snapshot> {
+  root = await realpath(root);
+  const head = await textGit(root, ["rev-parse", "--verify", `${headRef}^{commit}`]);
+  const baseCommit = await textGit(root, ["merge-base", baseRef, head]);
+  const [baseRows, headRows] = await Promise.all([treeRows(root, baseCommit), treeRows(root, head)]);
+  const scope = new Set<string>();
+  for (const path of new Set([...baseRows.keys(), ...headRows.keys()])) {
+    const a = baseRows.get(path), b = headRows.get(path);
+    if (a?.oid !== b?.oid || a?.mode !== b?.mode) scope.add(path);
+  }
+  if (scope.size > limits.files) throw new Error("More than 20000 changed files");
+  const paths = new Set([...scope, ...[...baseRows.keys(), ...headRows.keys()].filter(isPolicyPath)]);
+  const old = await treeFiles(root, baseRows, paths, signal), current = await treeFiles(root, headRows, paths, signal);
+  signal?.throwIfAborted();
+  return assemble({ baseRef, baseCommit, head, old, current, scope, context: contextFiles(baseRows, paths), objects: await gitObjects(root) }, signal);
+}
+const gitObjects = (root: string) => textGit(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+interface Captured {
+  baseRef: string; baseCommit: string; head: string;
+  /** Full contents of changed and policy paths on each side. */
+  old: Record<string, Entry>; current: Record<string, Entry>;
+  /** Paths whose differences are under review; captured policy files outside it are context. */
+  scope: Set<string>;
+  context: Record<string, Entry>; objects: string;
+}
+/** Lockfiles and build outputs nobody reviews line by line. */
+const GENERATED_NAMES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "uv.lock", "poetry.lock", "Pipfile.lock", "Cargo.lock", "go.sum", "composer.lock", "Gemfile.lock", "flake.lock"]);
+const DATA_EXTENSIONS = /\.(?:json|jsonl|ndjson|csv|tsv|snap|svg)$/i;
+/** A data file's hunks are collapsed once they exceed this many changed lines; small configuration files stay in the diff. */
+export const DATA_COLLAPSE_LINES = 200;
+/** What `.gitattributes` says about a path's place in the diff. */
+export interface DiffAttributes {
+  /** `linguist-generated`: true collapses, false marks hand-authored and keeps the file in the diff. */
+  generated?: boolean;
+  /** `review-collapse`: the toolkit's own attribute; it wins over every other rule. */
+  collapse?: boolean;
+}
+/**
+ * Why a changed file's hunks stay out of the shared diff, or undefined to keep them. In order:
+ * `review-collapse` from .gitattributes decides outright; `linguist-generated=false` keeps a file,
+ * `linguist-generated` collapses it; then lockfiles, minified files and source maps collapse; then
+ * data files collapse once they are large. The file's full text is captured either way.
+ */
+export function collapseReason(path: string, changed: number, attributes: (path: string) => DiffAttributes): string | undefined {
+  const name = path.split("/").pop() ?? path, attr = attributes(path);
+  if (attr.collapse === false) return undefined;
+  if (attr.collapse === true) return "review-collapse per .gitattributes";
+  if (attr.generated === false) return undefined;
+  if (attr.generated === true) return "generated per .gitattributes";
+  if (GENERATED_NAMES.has(name)) return "lockfile";
+  if (/\.min\.(?:js|css)$/i.test(name) || /\.map$/i.test(name)) return "minified or source map";
+  if (DATA_EXTENSIONS.test(name) && changed > DATA_COLLAPSE_LINES) return `data file, ${changed} changed lines`;
+  return undefined;
+}
+/**
+ * The diff-related attributes of `.gitattributes`, resolved like git does for the common forms:
+ * later lines override earlier ones, `name` and `name=true` set, `-name` and `name=false` unset,
+ * `!name` leaves the attribute unspecified. A pattern without a slash matches the basename anywhere;
+ * one with a slash is anchored at the repository root.
+ */
+export function diffAttributes(gitattributes: string | undefined): (path: string) => DiffAttributes {
+  if (!gitattributes) return () => ({});
+  const rules: { match: (path: string) => boolean; set: DiffAttributes }[] = [];
+  for (const raw of gitattributes.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const [pattern, ...attrs] = line.split(/\s+/);
+    const set: DiffAttributes = {};
+    for (const attr of attrs) {
+      const m = /^(-|!)?([\w.-]+)(?:=(.*))?$/.exec(attr);
+      if (!m) continue;
+      const [, prefix, name, value] = m;
+      const key = name === "linguist-generated" ? "generated" : name === "review-collapse" ? "collapse" : undefined;
+      if (!key || prefix === "!") continue;
+      set[key] = prefix !== "-" && value !== "false";
+    }
+    if (set.generated === undefined && set.collapse === undefined) continue;
+    const glob = pattern.includes("/") ? pattern.replace(/^\//, "") : `**/${pattern}`;
+    rules.push({ match: picomatch(glob, { dot: true, nocase: false }), set });
+  }
+  if (!rules.length) return () => ({});
+  return path => {
+    const out: DiffAttributes = {};
+    for (const rule of rules) if (rule.match(path)) Object.assign(out, rule.set);
+    return out;
+  };
+}
+const countLines = (text: string) => text.length ? text.split("\n").length - (text.endsWith("\n") ? 1 : 0) : 0;
+function assemble({ baseRef, baseCommit, head, old, current, scope, context, objects }: Captured, signal?: AbortSignal): Snapshot {
+  const inScope = (entries: Record<string, Entry>) => Object.fromEntries(Object.entries(entries).filter(([path]) => scope.has(path)));
+  const changes = makeChanges(inScope(old), inScope(current)), limitations: string[] = [];
+  const attributes = diffAttributes(current[".gitattributes"]?.text ?? old[".gitattributes"]?.text);
+  const patches: string[] = [];
+  for (const c of changes) {
+    const a = old[c.oldPath ?? c.path], b = current[c.path];
+    for (const [side, file] of [["old", a], ["new", b]] as const) if (file?.limitation) limitations.push(`${c.path} (${side}): ${file.limitation}`);
+    signal?.throwIfAborted();
+    let patch = "";
+    if (a?.text !== undefined || b?.text !== undefined) {
+      const full = createTwoFilesPatch(c.oldPath ?? c.path, c.path, a?.text ?? "", b?.text ?? "", "base", "snapshot", { context: 5, timeout: 5000 });
+      if (full === undefined) throw new Error(`Diff computation exceeded 5 seconds for ${c.path}`);
+      const body = full.split("\n").slice(4); // after the ---/+++ header
+      c.added = body.filter(l => l.startsWith("+")).length;
+      c.removed = body.filter(l => l.startsWith("-")).length;
+      const reason = collapseReason(c.path, c.added + c.removed, attributes);
+      if (reason) c.collapsed = reason; else patch = full;
+    }
+    const stats = c.added !== undefined ? `; +${c.added} -${c.removed}` : "";
+    const note = c.collapsed ? `; hunks collapsed (${c.collapsed}): read with read_snapshot if a change depends on it` : "";
+    patches.push(`Change: ${c.status} ${JSON.stringify(c.oldPath ?? c.path)} -> ${JSON.stringify(c.path)}; mode ${a?.mode ?? "absent"} -> ${b?.mode ?? "absent"}${stats}${note}\n${patch}`);
+  }
+  const diff = fileMap(changes) + patches.join("");
+  if (Buffer.byteLength(diff) > limits.diff) throw new Error("Review diff exceeds 8 MiB; narrow the branch changes");
+  const id = hash(JSON.stringify({ baseRef, baseCommit, head, old, current, context, changes }));
+  return { id, baseRef, baseCommit, head, old, current, context, objects, changes, diff, limitations };
+}
+/** The map at the top of the shared diff: every changed file with its size, so a reviewer can go to the files its lens needs. */
+export function fileMap(changes: Change[]): string {
+  const added = changes.reduce((n, c) => n + (c.added ?? 0), 0), removed = changes.reduce((n, c) => n + (c.removed ?? 0), 0);
+  const collapsed = changes.filter(c => c.collapsed).length;
+  const rows = changes.map(c => `  ${c.status.padEnd(8)} ${c.path}${c.oldPath ? ` (from ${c.oldPath})` : ""}${c.added !== undefined ? `  +${c.added} -${c.removed}` : ""}${c.collapsed ? `  [collapsed: ${c.collapsed}]` : ""}`);
+  return `Files: ${changes.length} changed, +${added} -${removed} lines${collapsed ? `, ${collapsed} collapsed (hunks omitted below; full text readable with read_snapshot)` : ""}\n${rows.join("\n")}\n\n`;
 }

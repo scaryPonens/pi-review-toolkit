@@ -4,7 +4,7 @@ A self-contained Pi extension for the **Review** stage only. `/review` captures 
 
 ## Install
 
-Requires **Pi 1.3.0 installed through Node/npm**, Node **22.19+**, Git, and either **Herdr 0.8.x** in a managed pane or **tmux 3.2+**. Bun/standalone bundled Pi installations and Windows are not supported by this first release. The runtime version check deliberately fails closed on other Pi versions.
+Requires **Pi 1.3.0 or 1.5.0 installed through Node/npm**, Node **22.19+**, Git, and one of: **Herdr 0.8.x** in a managed pane, an **Orca** terminal, or **tmux 3.2+**. Bun/standalone bundled Pi installations and Windows are not supported by this first release. The runtime version check deliberately fails closed on other Pi versions.
 
 From this package directory:
 
@@ -25,8 +25,12 @@ Local-source installations need the build step. The npm tarball includes `dist/`
 ## Use
 
 ```text
-/review [--base <git-ref>] [--min-severity low|medium|high|critical]
+/review [--base <git-ref> | --pr <number>] [--min-severity low|medium|high|critical]
 /review --base origin/main --min-severity medium
+/review --base parent-branch          # a branch stacked on parent-branch
+/review --pr 45093                   # a pull request, stacked or not
+/review --pr 45294 --base main       # a pull request's head against another ref: a stack's combined effect
+/review-stack 45294 [--whole] [--min-severity high]   # every open pull request in the stack under #45294
 /review --min-severity high
 /review-cancel
 ```
@@ -37,11 +41,26 @@ When `--base` is absent, the extension accepts exactly one locally configured re
 
 The selected ref is resolved to its merge base with `HEAD`. The report covers changes between that commit and the final working-tree contents: committed branch changes, staged/unstaged changes combined, and non-ignored untracked files. No fetch, stash, checkout, or live index write occurs. An empty diff returns **No changes to review**, launching no workers.
 
+### Stacked branches and pull requests
+
+A stacked branch is reviewed against its parent: `/review --base <parent branch>`. Because the review starts from the merge base, changes added to the parent after the child branched off stay out of the child's review.
+
+`/review --pr <number>` reviews a pull request without checking it out. `gh pr view` supplies the head and base commits, and the review compares exactly those commits, read from git objects alone. The local working tree, index, and current branch are never read, so it works from any checkout. A parent branch that moves mid-review, including tool-managed bases such as `graphite-base/<n>`, cannot change what is reviewed. `--pr` requires an authenticated `gh`. With `--base <ref>` as well, the pull request's head is compared against that ref instead of its own base; for the top of a stack and the default branch, that is the whole stack's combined effect. Nothing is fetched: when either commit is missing locally, the review stops and names the `git fetch origin …` to run. The report records the pull request number, URL, state, head and base.
+
+`/review-stack <top pull request>` (and the `review_stack` tool) reviews a whole stack. One `gh pr list` of open pull requests maps the stack below the given pull request. Each base is matched to its parent by branch name or, for tool-managed bases such as `graphite-base/<n>` that are no pull request's head, by pointing at exactly one open pull request's head commit. The walk ends at the repository's default branch. Before any reviewer starts, it reports stack shape problems:
+
+- a bottom pull request whose base belongs to a closed or merged pull request, or to no pull request at all;
+- a base shared by several open pull requests, which stops the walk;
+- a child that does not contain its parent's latest head;
+- other open pull requests stacked on a reviewed one, which are not reviewed.
+
+If any stack commit is missing locally, it stops and names one `git fetch origin …` for all of them. It then reviews the pull requests bottom first, **one at a time**, each exactly as `/review --pr` would, so every review covers only that pull request's own changes. Reviewers are told where the pull request sits (its parent, the pull requests below and above, the root branch), so code from the stack below is treated as pre-existing and a defect that lives there is attributed to that pull request. **Each pull request's report is sent as soon as its review ends**, before the next starts; the combined report follows at the end with one status line per pull request (flagging any that is behind its parent). A finding whose file a later pull request changes again carries `touchedAbove` (file-level: the reports carry changed paths, not hunks), so the reader checks that pull request before acting. With `--whole`, one more review compares the top pull request's head against the stack's root: the stack's combined effect. A pull request that cannot be reviewed is reported as incomplete without stopping the rest; the stack is incomplete when any of its pull requests is. `/review-cancel` stops the current review and skips the rest. Each pull request runs all selected reviewers, so a stack of *n* pull requests takes roughly *n* times one review.
+
 TUI/RPC commands start background work so `/review-cancel` remains usable. Print/JSON command handlers wait for completion, so the process cannot exit before the report is appended. The extension uses `pi.sendMessage(..., { triggerTurn: false })`, not a follow-up/user prompt. JSON/RPC/SDK consumers can inspect the custom `parallel-review` message and its structured `details.report`; plain print output is not a separate stable report protocol.
 
 ### Model-callable review
 
-Agents can invoke `review_changes({ min_severity: "medium" })` (or `{}` for the same default). It waits for the same parallel, isolated, read-only review used by `/review`. The tool uses the configured remote default base; configure exactly one `refs/remotes/*/HEAD` before invoking it.
+Agents can invoke `review_changes({ min_severity: "medium" })` (or `{}` for the same default). It waits for the same parallel, isolated, read-only review used by `/review`. Without arguments the tool uses the configured remote default base; configure exactly one `refs/remotes/*/HEAD` before invoking it. `review_changes({ base: "parent-branch" })` and `review_changes({ pr: 45093 })` match `/review --base` and `/review --pr`; `pr` results also carry a `pullRequest` object.
 
 The result includes `status` (`passed`, `findings`, or `incomplete`), `minimumSeverity`, actionable consolidated `findings` (severity, file, line, old/new side, description, suggested resolution), per-reviewer statuses/errors, coverage errors, snapshot/base identity, and unfiltered human-judgment requests. Data is available as JSON text, `structuredContent`, and `details`. An empty diff maps to `passed` with `noChanges: true` and skipped reviewers; `/review` retains its existing **no-changes** outcome.
 
@@ -56,7 +75,7 @@ Package installation also supplies [`build-review-fix`](skills/build-review-fix/
 /skill:build-review-fix Implement <task>. Use min_severity: high and max_review_rounds: 2.
 ```
 
-The current Pi agent implements the task, runs tests, calls `review_changes`, fixes actionable findings, and re-reviews. Defaults are medium severity and at most three review calls. Every round covers the accumulated changes against the original configured merge base, not just the latest fixes. The tool requires exactly one remote symbolic default (`refs/remotes/*/HEAD`); it has no base argument. The skill stops if that scope cannot be established or changes during the workflow.
+The current Pi agent implements the task, runs tests, calls `review_changes`, fixes actionable findings, and re-reviews. Defaults are medium severity and at most three review calls. Every round covers the accumulated changes against the original configured merge base, not just the latest fixes. Without a `base`, the tool requires exactly one remote symbolic default (`refs/remotes/*/HEAD`); on a stacked branch, the skill passes the parent branch as `base`. The skill stops if that scope cannot be established or changes during the workflow.
 
 Completion requires a latest `passed` review, all applicable reviewers successfully completed, and passing relevant tests. Incomplete reviews, exhausted rounds, and human-judgment requests are reported rather than treated as approval. The extension itself remains read-only; this optional skill supplies workflow instructions, not another runtime or implementation agent.
 
@@ -67,6 +86,14 @@ Loading only `dist/extension.js` with `-e` does not load the companion skill; al
 All reviewers use the invoking session's selected **provider and exact model ID**, with medium thinking (clamped by Pi). Workers read Pi's configured credential directory (`PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`) for `auth.json` and `models.json`, plus the normal trusted provider environment. No secrets are copied into the model prompt or report.
 
 Only built-in/configured physical models are available in children. Provider extensions, virtual routers, session-only API-key overrides, and custom capabilities from the invoking conversation are **not inherited**. Missing child models/credentials are explicit failed reviewer outcomes, not a fallback to another model. Normal agent/provider retries and compaction are disabled; there is no automatic reviewer retry. Provider credential refresh remains a trusted Pi runtime function.
+
+When the session's provider comes from an extension, for example a provider routed through a company proxy, list that extension in the **global** settings file (`~/.pi/agent/settings.json`):
+
+```json
+{ "parallelReview": { "providerExtensions": ["~/.pi/extensions/bedrock-runtime.ts"] } }
+```
+
+Each reviewer loads those extensions only to register their model providers in its own model runtime. Their tools, commands, and event handlers are never bound to the reviewer session, which still exposes exactly the review tools. Paths may start with `~/`, or be relative to the agent directory. Project settings are not read, because each listed extension runs as code in every reviewer.
 
 ### Reviewers
 
@@ -85,7 +112,7 @@ These are this extension's conventions, not Copilot's actual file paths:
 
 - `.agent/reviewer-instructions.md`: repository-wide review guidance.
 - `.agent/instructions/**/*.instructions.md`: recursively discovered path-specific guidance.
-- Root `HUMAN.md`: circumstances requiring human judgment or approval. No nested inheritance.
+- `.agents/HUMAN.md` (or root `HUMAN.md`; not both): circumstances requiring human judgment or approval. No nested inheritance. When the repository has neither, the operator's own `~/.pi/agent/HUMAN.md` applies instead, read at run time rather than captured with the snapshot; a repository file replaces it whole.
 
 All are captured with the snapshot. Missing files are normal. Ignored untracked policy files are still captured as guidance, but are not added to the review diff solely because they were discovered. Files are sorted by repository-relative path; order is not precedence.
 
@@ -120,14 +147,22 @@ Malformed/unreadable/oversized guidance makes the review **incomplete**. Discove
 
 ## Snapshot and security boundary
 
-The snapshot is a private serialized manifest containing captured UTF-8 repository context, old/current file hashes and modes, changed paths, and a centrally generated diff. It is **not a detached worktree** and contains no repository executables that reviewers can run. The parent captures twice, compares content manifests, index/HEAD identities and merge-base resolution, and retries up to three times if edits are detected. Snapshot IDs are SHA-256 over the canonical capture data, including policy contents. Later edits do not change an active review. Exact-content/mode renames are recognized; uncertain renames remain addition/deletion pairs.
+The snapshot is a private serialized manifest containing the full contents of changed and policy files on each side, the blob id and mode of every unchanged file, changed paths, and a centrally generated diff. Unchanged files are identical on both sides, so reviewers read and search them from git objects on demand (`git cat-file` by blob id and `git grep` of the base commit, with lazy fetching disabled), and repository size does not bound a review. Search collects at most 20,000 hits per query and says so when it stops. Changed files are limited to 20,000 paths and 64 MiB of content, and the diff to 8 MiB.
+
+The shared diff opens with a **file map**: every changed file with its added and removed line counts, so a reviewer reads the files its specialization covers instead of paging from the top. **Generated files** (paths marked `linguist-generated` in `.gitattributes`, lockfiles, minified files and source maps) and **large data files** (`.json`, `.jsonl`, `.csv`, `.tsv`, `.snap`, `.svg` with more than 200 changed lines) are **collapsed**: the map and the manifest show them with a reason, their hunks are left out of the diff, and their full text stays in the snapshot, so reviewers can read them with `read_snapshot` and cite lines in them. A repository adjusts this in `.gitattributes`, read from the reviewed tree: `linguist-generated=false` (or `-linguist-generated`) marks a path hand-authored and keeps it in the diff whatever its size or name; `review-collapse=false` does the same and wins over every rule; `review-collapse` (or `=true`) collapses any path. Later lines override earlier ones, as in git.
+
+```gitattributes
+# .gitattributes
+voltuspy/besstie_pro_forma_engine/catalogue/*.json   linguist-generated=false   # hand-written catalogues: review them
+voltuspy/besstie_pro_forma_engine/tests/golden/**    review-collapse            # reference outputs: never in the diff
+``` On a 15-pull-request stack in a 31k-file monorepo this cut the diffs by 89–98%, mostly reference fixtures. Each reviewer's token spend (requests, input, cached, output, estimated cost) is recorded from its session and shown per reviewer and in total in the report and in `review_changes` results. It is **not a detached worktree** and contains no repository executables that reviewers can run. The parent captures twice, compares content manifests, ind...
 
 Each child is a fresh Node process running Pi's SDK with:
 
 - An in-memory conversation and in-memory settings, no invoking history.
 - A custom `ResourceLoader` returning **zero extensions, skills, templates, themes, context files, or MCP services**. Neither project `AGENTS.md` nor the normal `/review` entry point loads.
 - Only `read_snapshot`, `list_snapshot`, `search_snapshot`, `read_review_diff`, `review_changes`, `submit_review`, and `cannot_complete_review` exposed. There is no shell, write/edit, arbitrary execution, browser, delegation, or recursive orchestration tool.
-- Repository tools backed **only by captured data in memory**, never by caller-provided filesystem paths. Reads require captured relative paths and do not follow symlinks; search is literal, not user-supplied regex execution.
+- Repository tools backed **only by captured data**, never by caller-provided filesystem paths: changed files in memory, unchanged files by the blob ids the parent recorded. Reads require captured relative paths and do not follow symlinks; search is literal, not user-supplied regex execution.
 - A trusted result writer, outside the repository, that atomically publishes a bounded artifact after validation.
 
 This is a **tool capability boundary, not an OS sandbox**. It prevents model tool access from mutating repository content or reading the live checkout. Trusted Node/Pi/provider modules and trusted orchestration still have host permissions, credentials, temporary state, and model network access. It does not protect against a compromised runtime, malicious installed package, hostile same-user process changing private artifacts, or OS-level attacks. The double-capture consistency check is bounded detection, not an atomic filesystem transaction against an adversarial writer. Unrestricted shell would require a separate OS-enforced sandbox and is not implemented.
@@ -155,7 +190,7 @@ Snapshots are private `pi-review-run-*` directories (0700) with snapshot/job fil
 
 ## Results, status, and handoff
 
-Results use schema version 1 with runtime validation of identity, structure, bounds, severity, captured paths, old/new line locations, and instruction/policy references. Maximum **1 MiB per reviewer**, **300 findings + 300 judgment requests**, **12,000 characters per substantive string**, **1,000 per section**, and **4,096 per path**. Invalid complete results fail the reviewer; malformed findings are never dropped to manufacture success.
+Results use schema version 1 with runtime validation of identity, structure, bounds, severity, captured paths, old/new line locations, and instruction/policy references. Maximum **1 MiB per reviewer**, **300 findings + 300 judgment requests**, **12,000 characters per substantive string**, **1,000 per section**, and **4,096 per path**. An invalid submission is answered with the exact validation error (for example `findings[2]: unknown fields ["confidence"]`), and the reviewer may correct and resubmit; after **3 invalid submissions** the reviewer fails. Only a fully valid result is accepted, and malformed findings are never dropped to manufacture success.
 
 Aggregation is deterministic: validate, retain valid partial outcomes, severity-filter findings, conservatively merge exact whitespace-normalized duplicate issues AND resolutions at the same location, preserve reviewer attribution/references, independently deduplicate judgment requests, then sort by descending severity/file/line/stable textual ties. There is no LLM aggregation stage.
 
@@ -176,7 +211,7 @@ The full report contains scope identities, selection/completion/failure reasons,
 
 ## Lifecycle and retention
 
-Herdr is preferred only inside an appropriate managed environment (`HERDR_ENV=1`, `HERDR_PANE_ID`). Background panes use actual returned IDs, `--no-focus`, and only the caller/owned panes for splitting. Otherwise, the tmux backend creates uniquely named detached single-pane sessions and parses returned pane IDs. No backend switching occurs after selection or partial execution. Missing backends fail clearly.
+Herdr is preferred only inside an appropriate managed environment (`HERDR_ENV=1`, `HERDR_PANE_ID`). Background panes use actual returned IDs, `--no-focus`, and only the caller/owned panes for splitting. Next, inside an Orca terminal (`ORCA_TERMINAL_HANDLE`), reviewers run in one dedicated `pi-review` tab opened without taking focus: the first reviewer creates the tab, each later one splits the tab's largest pane along its longer side, and the invoking terminal is never resized. Commands run under `/bin/sh` rather than the login shell Orca types into, and closing the last pane removes the tab. The CLI is `ORCA_CLI_COMMAND`, else `orca-dev` in an Orca dev checkout, else `orca`. Otherwise, the tmux backend creates uniquely named detached single-pane sessions and parses returned pane IDs. No backend switching occurs after selection or partial execution. Missing backends fail clearly.
 
 Deadlines: **15 minutes per reviewer**, **20 minutes for the run**, including capture. Cancellation/deadline checks are cooperative during capture; an in-flight bounded Git/backend operation may take its remaining operation budget to unwind. A blocked model never receives automatic approval. Worker exit, terminal idleness, and visible text are not success: only validated matching result artifacts count. Results are never collected by scraping scrollback.
 

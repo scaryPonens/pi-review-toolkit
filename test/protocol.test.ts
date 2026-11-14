@@ -9,6 +9,10 @@ test("argument validation rejects invalid/missing/duplicate flags and unexpected
   assert.equal(parseArgs("").minimumSeverity, "medium");
   for (const severity of severities) assert.equal(parseArgs(`--min-severity ${severity} --base origin/main`).minimumSeverity, severity);
   for (const input of ["--min-severity", "--min-severity urgent", "--base", "--base --min-severity high", "oops", "--unknown x", "--min-severity HIGH", "--base main extra", "--base main --base other"]) assert.throws(() => parseArgs(input), /Usage/);
+  assert.deepEqual(parseArgs("--pr 45093 --min-severity high"), { pr: 45093, minimumSeverity: "high" });
+  assert.equal(parseArgs("--pr #12").pr, 12);
+  for (const input of ["--pr", "--pr 0", "--pr 1.5", "--pr abc", "--pr 12345678901", "--pr 1 --pr 2"]) assert.throws(() => parseArgs(input), /Usage/);
+  assert.deepEqual(parseArgs("--pr 1 --base main"), { pr: 1, base: "main", minimumSeverity: "medium" });
 });
 test("strict result validation accepts captured new and deleted old locations", () => {
   const j = job(), r = result(j);

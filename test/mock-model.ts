@@ -3,7 +3,8 @@ import { mkdtemp, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Result, Reviewer } from "../src/types.js";
-export async function mockModel(delay = 0, attack = false, invalidSubmission = false) {
+/** `invalid` lists the submissions to get wrong, in order, before submitting a valid result. */
+export async function mockModel(delay = 0, attack = false, invalid: ("arguments" | "fields")[] = [], unavailable = false) {
   const directory = await mkdtemp(join(tmpdir(), "review-model-"));
   const requests: any[] = [], identities = new Set<string>();
   let live = 0, peak = 0;
@@ -23,14 +24,15 @@ export async function mockModel(delay = 0, attack = false, invalidSubmission = f
       else if (attack && count === 1) { name = "bash"; args = { command: "touch SHOULD_NOT_EXIST" }; }
       else if (attack && count === 2) { name = "read_snapshot"; args = { path: "/etc/passwd", side: "new" }; }
       else if (attack && count === 3) { name = "read_snapshot"; args = { path: "escape", side: "new" }; }
-      if (invalidSubmission && count === 0) args = { notJson: true };
+      if (count < invalid.length) args = invalid[count] === "arguments" ? { notJson: true } : { json: JSON.stringify({ ...result, confidence: 0.9 }) };
+      if (unavailable) { res.writeHead(503, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: { message: "upstream proxy unreachable" } })); return; }
       live++; peak = Math.max(peak, live);
       if (delay) await new Promise(resolve => setTimeout(resolve, delay));
       live--;
       res.writeHead(200, { "Content-Type": "text/event-stream" });
       const event = (choices: unknown[]) => `data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices })}\n\n`;
       res.write(event([{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }]));
-      res.write(event([{ index: 0, delta: {}, finish_reason: "tool_calls" }])); res.end("data: [DONE]\n\n");
+      res.write(`data: ${JSON.stringify({ id: `fixture-${requests.length}`, object: "chat.completion.chunk", created: 1, model: "fixture", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 1200, completion_tokens: 40, total_tokens: 1240 } })}\n\n`); res.end("data: [DONE]\n\n");
     } catch (e) { errors.push(e as Error); res.writeHead(500); res.end("fixture error"); }
   });
   await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
